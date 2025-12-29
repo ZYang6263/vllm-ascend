@@ -1856,10 +1856,24 @@ class NPUModelRunner(GPUModelRunner):
                 # QUESTION: Why do we separately set query_start_loc for spec in the first place?
                 # While in _prepare_inputs we don't?
                 if self.speculative_config:
-                    self.query_start_loc.gpu[:num_reqs + 1] = torch.tensor(
-                        [0] + self.actual_seq_lengths_q[:num_reqs],
-                        device=self.device,
-                        dtype=torch.int32)
+                    # 当 capture graph 的 batch 较大时，可能超过
+                    # actual_seq_lengths_q 预先构建的长度，需回退到基于
+                    # cu_num_tokens 的对齐方式，避免形状不匹配。
+                    if len(self.actual_seq_lengths_q) >= num_reqs:
+                        qs_tensor = torch.tensor(
+                            [0] + self.actual_seq_lengths_q[:num_reqs],
+                            device=self.device,
+                            dtype=torch.int32)
+                    else:
+                        qs_tensor = torch.cat(
+                            (torch.tensor([0],
+                                          device=self.device,
+                                          dtype=torch.int32),
+                             torch.as_tensor(cu_num_tokens,
+                                             device=self.device,
+                                             dtype=torch.int32)))
+                    self.query_start_loc.gpu[:num_reqs + 1] = qs_tensor
+                    self.query_start_loc.cpu[:num_reqs + 1] = qs_tensor.cpu()
                 common_attn_metadata = AscendCommonAttentionMetadata(
                     query_start_loc=self.query_start_loc.gpu[:num_reqs + 1],
                     query_start_loc_cpu=self.query_start_loc.cpu[:num_reqs +
@@ -2013,6 +2027,15 @@ class NPUModelRunner(GPUModelRunner):
             num_scheduled_tokens_list = [max_query_len] * num_reqs
             if num_tokens % max_query_len != 0:
                 num_scheduled_tokens_list[-1] = num_tokens % max_query_len
+            if num_reqs > max_num_reqs:
+                # 捕获/假跑批次超过预分配容量时，回退为分配式切分，
+                # 避免 query_start_loc/seq_lens 等缓冲越界。
+                num_reqs = max_num_reqs
+                min_tokens_per_req = num_tokens // num_reqs
+                num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
+                num_scheduled_tokens_list[-1] += num_tokens % num_reqs
+                # 更新 max_query_len 以与新的分配保持一致
+                max_query_len = max(num_scheduled_tokens_list)
         else:
             if with_prefill:
                 num_reqs = num_tokens
@@ -2039,6 +2062,19 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_padded = batch_descriptor.num_tokens
         num_reqs_padded = (batch_descriptor.num_reqs if
                            batch_descriptor.num_reqs is not None else num_reqs)
+        if num_reqs_padded > self.max_num_reqs:
+            # batch_descriptor 可能为 graph capture 返回更大的批次形状，
+            # 超出预分配缓冲长度（query_start_loc/seq_lens）。这里截断到
+            # max_num_reqs，避免后续写入越界。
+            logger.warning(
+                "batch_descriptor.num_reqs=%s exceeds max_num_reqs=%s during dummy_run; "
+                "truncating to avoid buffer overflow.",
+                num_reqs_padded, self.max_num_reqs)
+            num_reqs_padded = self.max_num_reqs
+            num_scheduled_tokens = num_scheduled_tokens[:num_reqs_padded]
+            num_tokens_padded = int(num_scheduled_tokens.sum())
+            if num_tokens_across_dp is not None:
+                num_tokens_across_dp[:] = num_tokens_padded
         if num_tokens_across_dp is not None and num_tokens_padded != num_tokens:
             # pad is needed if the pad of `num_tokens` is triggered inside CudagraphDispatcher
             num_tokens_across_dp[:] = num_tokens_padded

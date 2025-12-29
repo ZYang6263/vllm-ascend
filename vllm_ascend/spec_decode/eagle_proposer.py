@@ -176,7 +176,8 @@ class EagleProposer(Proposer):
 
         with set_ascend_forward_context(None,
                                         self.vllm_config,
-                                        num_tokens=num_tokens):
+                                        num_tokens=num_tokens,
+                                        disable_eagle_flashcomm=True):
             self.model(
                 input_ids=self.input_ids[:num_tokens],
                 positions=self.positions[:num_tokens],
@@ -374,7 +375,8 @@ class EagleProposer(Proposer):
 
         with set_ascend_forward_context(attn_metadata,
                                         self.vllm_config,
-                                        num_tokens=num_input_tokens):
+                                        num_tokens=num_input_tokens,
+                                        disable_eagle_flashcomm=True):
             last_hidden_states, hidden_states = self.model(
                 input_ids=self.input_ids[:num_input_tokens],
                 positions=self.positions[:num_input_tokens],
