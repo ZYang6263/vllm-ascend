@@ -1,6 +1,7 @@
-# GLM-5
+# GLM-5/GLM-5.1
 
 ## Introduction
+This document applies to both `GLM-5` and `GLM-5.1`. Unless otherwise specified, all descriptions, configurations, and deployment procedures for `GLM-5` in this document also apply to `GLM-5.1`. For brevity, `GLM-5` is used hereafter as a unified reference to both `GLM-5` and `GLM-5.1`.
 
 [GLM-5](https://huggingface.co/zai-org/GLM-5) use a Mixture-of-Experts (MoE) architecture and targeting at complex systems engineering and long-horizon agentic tasks.
 
@@ -21,6 +22,9 @@ Refer to [feature guide](../../user_guide/feature_guide/index.md) to get the fea
 - `GLM-5`(BF16 version): [Download model weight](https://www.modelscope.cn/models/ZhipuAI/GLM-5).
 - `GLM-5-w4a8`: [Download model weight](https://modelscope.cn/models/Eco-Tech/GLM-5-w4a8).
 - `GLM-5-w8a8`: [Download model weight](https://www.modelscope.cn/models/Eco-Tech/GLM-5-w8a8).
+- `GLM-5.1`(BF16 version): [Download model weight](https://huggingface.co/zai-org/GLM-5.1).
+- `GLM-5.1-w4a8`: [Download model weight](https://modelers.cn/models/Eco-Tech/GLM-5.1-w4a8).
+- `GLM-5.1-w8a8`: [Download model weight](https://modelers.cn/models/Eco-Tech/GLM-5.1-w8a8).
 - You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantify the model naively.
 
 It is recommended to download the model weight to the shared directory of multiple nodes, such as `/root/.cache/`
@@ -1284,8 +1288,6 @@ python load_balance_proxy_server_example.py \
     --host 0.0.0.0 \
     --prefiller-hosts \
        $node_p0_ip \
-       $node_p0_ip \
-       $node_p1_ip \
        $node_p1_ip \
     --prefiller-ports \
        6700 \
