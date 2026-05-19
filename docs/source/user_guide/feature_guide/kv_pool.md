@@ -1,16 +1,8 @@
 # Ascend Store Deployment Guide
 
-## Environmental Dependencies
+## KV Pool Parameter Description
 
-* Software:
-    * CANN >= 8.5.0
-    * vLLM：main branch
-    * vLLM-Ascend：main branch
-    * mooncake：>= 0.3.9
-
-### KV Pool Parameter Description
-
-#### `kv_connector_extra_config`: Additional Configurable Parameters for Pooling
+### `kv_connector_extra_config`: Additional Configurable Parameters for Pooling
 
 | Parameter | Description |
 | :--- | :--- |
@@ -95,9 +87,9 @@ export PYTHONHASHSEED=0
 
 | Hardware | HDK & CANN versions | Export Command | Description |
 | :--- | :--- | :--- | :--- |
-| 800 I/T A3 series | HDK >= 26.0.0<br>CANN >= 9.0.0 | `export ASCEND_ENABLE_USE_FABRIC_MEM=1` | **Recommended**. Enables unified memory address direct transmission scheme. |
+| 800 I/T A3 series | HDK >= 25.5<br>CANN >= 9.0.0<br>LingQu Computing Network >= 1.5 | `export ASCEND_ENABLE_USE_FABRIC_MEM=1` | **Recommended**. Enables unified memory address direct transmission scheme. |
 | 800 I/T A3 series | 25.5.0<=HDK<26.0.0 | `export ASCEND_BUFFER_POOL=4:8` | Configures the number and size of buffers on the NPU Device for aggregation and KV transfer (e.g., `4:8` means 4 buffers of 8MB). |
-| 800 I/T A2 series | N/A | `export HCCL_INTRA_ROCE_ENABLE=1` | Required by direct transmission cheme on 800 I/T A2 series|
+| 800 I/T A2 series | N/A | `export HCCL_INTRA_ROCE_ENABLE=1` | Required by direct transmission scheme on 800 I/T A2 series|
 
 ### FAQ for HIXL (ascend_direct) backend
 
@@ -153,7 +145,7 @@ The content of the multi_producer.sh script:
 
 ```shell
 export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:$LD_LIBRARY_PATH
-export PYTHONHASHSEED=0 
+export PYTHONHASHSEED=0
 export PYTHONPATH=$PYTHONPATH:/xxxxx/vllm
 export MOONCAKE_CONFIG_PATH="/xxxxxx/mooncake.json"
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
@@ -163,7 +155,7 @@ export ASCEND_ENABLE_USE_FABRIC_MEM=1
 #A2
 #export HCCL_INTRA_ROCE_ENABLE=1
 
-#Minimum retransmission timeout of the RDMA，equals 4.096 μs * 2 ^ timeout.
+#Minimum retransmission timeout of the RDMA, equals 4.096 μs * 2 ^ timeout.
 #Needs to satisfy the equation: ASCEND_TRANSFER_TIMEOUT > RDMA_TIMEOUT * 7, where 7 is the default number of retry for RDMA transfer.
 #HCCL_RDMA_TIMEOUT also affects collective communication behavior and should be configured carefully.
 export HCCL_RDMA_TIMEOUT=17
@@ -232,7 +224,7 @@ The content of multi_consumer.sh:
 ```shell
 export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:$LD_LIBRARY_PATH
 export PYTHONPATH=$PYTHONPATH:/xxxxx/vllm
-export PYTHONHASHSEED=0 
+export PYTHONHASHSEED=0
 export MOONCAKE_CONFIG_PATH="/xxxxx/mooncake.json"
 export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7
 export ACL_OP_INIT_MODE=1
@@ -349,7 +341,7 @@ export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packa
 export PYTHONPATH=$PYTHONPATH:/xxxxx/vllm
 export MOONCAKE_CONFIG_PATH="/xxxxxx/mooncake.json"
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
-export PYTHONHASHSEED=0 
+export PYTHONHASHSEED=0
 export ACL_OP_INIT_MODE=1
 #A3
 export ASCEND_ENABLE_USE_FABRIC_MEM=1
@@ -409,16 +401,16 @@ This is because HCCL one-sided communication connections are created lazily afte
 
 **MemCache depends on MemFabric. Therefore, MemFabric must be installed.Installing the memcache after the memfabric is installed.**
 
-* **memfabric_hybrid**: <https://gitcode.com/Ascend/memfabric_hybrid/tree/master/doc/build.md>
+* **memfabric_hybrid**: <https://gitcode.com/Ascend/memfabric_hybrid/blob/master/doc/installation.md>
 
 * **memcache**: <https://gitcode.com/Ascend/memcache/blob/master/doc/build.md>
 
 ### Configuring the memcache Config File
 
-    config Path：/usr/local/memcache_hybrid/latest/config/
-    **Config file parameters description**：<https://gitcode.com/Ascend/memcache/blob/develop/doc/memcache_config.md>
+config Path：/usr/local/memcache_hybrid/latest/config/
+**Config file parameters description**：<https://gitcode.com/Ascend/memcache/blob/develop/doc/memcache_config.md>
 
-    Set TLS certificate configurations. If TLS is disabled, you do not need to upload a certificate. If TLS is enabled, you need to upload a certificate.
+Set TLS certificate configurations. If TLS is disabled, you do not need to upload a certificate. If TLS is enabled, you need to upload a certificate.
 
 ```shell
 # mmc-meta.conf
@@ -650,7 +642,7 @@ vllm serve xxxxxxx/Qwen3-32B \
   --max-num-batched-tokens 16384 \
   --trust-remote-code \
   --gpu-memory-utilization 0.9 \
-  --max-num_seqs 20 \
+  --max-num-seqs 20 \
   --no-enable-prefix-caching \
   --kv-transfer-config \
     '{
@@ -729,7 +721,7 @@ vllm serve xxxxxxx/Qwen3-32B \
   --max-num-batched-tokens 16384 \
   --trust-remote-code \
   --gpu-memory-utilization 0.9 \
-  --max-num_seqs 20 \
+  --max-num-seqs 20 \
   --no-enable-prefix-caching \
   --kv-transfer-config \
   '{
@@ -796,7 +788,7 @@ python -m vllm.entrypoints.openai.api_server \
   --data-parallel-size 2 \
   --tensor-parallel-size 8 \
   --port 30050 \
-  --max-num_seqs 20 \
+  --max-num-seqs 20 \
   --max-model-len 32768 \
   --max-num-batched-tokens 16384 \
   --enable_expert_parallel \
@@ -869,7 +861,7 @@ python -m vllm.entrypoints.openai.api_server \
   --enforce-eager\
   --quantization ascend \
   --no-enable-prefix-caching \
-  --max-num_seqs 20 \
+  --max-num-seqs 20 \
   --speculative-config '{"num_speculative_tokens": 1, "method":"deepseek_mtp"}' \
   --enable_expert_parallel \
   --gpu-memory-utilization 0.9 \
@@ -967,7 +959,7 @@ vllm serve xxxxxxx/DeepSeek-R1 \
   --trust-remote-code \
   --gpu-memory-utilization 0.9 \
   --quantization ascend \
-  --max-num_seqs 20 \
+  --max-num-seqs 20 \
   --enable-expert-parallel \
   --no-enable-prefix-caching \
   --kv-transfer-config \
@@ -1032,7 +1024,7 @@ vllm serve xxxxxxx/DeepSeek-R1 \
   --trust-remote-code \
   --gpu-memory-utilization 0.9 \
   --quantization ascend \
-  --max-num_seqs 20 \
+  --max-num-seqs 20 \
   --enable-expert-parallel \
   --no-enable-prefix-caching \
   --kv-transfer-config \
@@ -1081,7 +1073,7 @@ python -m vllm.entrypoints.openai.api_server \
   -dp 2 \
   -tp 8 \
   --port 30050 \
-  --max-num_seqs 20 \
+  --max-num-seqs 20 \
   --max-model-len 32768 \
   --max-num-batched-tokens 16384 \
   --speculative-config '{"num_speculative_tokens": 1, "method":"deepseek_mtp"}' \
@@ -1115,6 +1107,11 @@ python -m vllm.entrypoints.openai.api_server \
 pip install openyuanrong-datasystem
 ```
 
+If the prebuilt package does not match the CANN or Ascend driver version in
+your environment, build Yuanrong Datasystem from source in the vLLM Ascend
+image. Follow the official Yuanrong Datasystem build instructions:
+<https://atomgit.com/openeuler/yuanrong-datasystem>
+
 ### Start etcd
 
 Yuanrong Datasystem uses etcd for service discovery. The following example
@@ -1147,7 +1144,7 @@ etcdctl --endpoints "${ETCD_IP}:2379" get key
 ```
 
 For production environments, refer to the official etcd clustering
-documentation: <https://etcd.io/docs/current/op-guide/clustering/>
+documentation: <https://etcd.io/docs/v3.7/op-guide/clustering/>
 
 ### Start Datasystem Worker
 
@@ -1157,7 +1154,8 @@ Start a Datasystem worker on each node by using `dscli`:
 dscli start -w \
   --worker_address "${WORKER_IP}:31501" \
   --etcd_address "${ETCD_IP}:2379" \
-  --shared_memory_size_mb 20480
+  --shared_memory_size_mb 40960 \
+  --enable_worker_worker_batch_get=true
 ```
 
 The `--worker_address` value is consumed later by `DS_WORKER_ADDR`, so keep
@@ -1182,7 +1180,7 @@ Set the following environment variables on each node before starting vLLM:
 | `PYTHONHASHSEED` | Yes | `0` | Must be consistent across all nodes to guarantee uniform hash generation. |
 | `DS_WORKER_ADDR` | Yes | N/A | Datasystem worker address in `<host>:<port>` format. This must match the local `dscli start --worker_address` value. |
 | `DS_ENABLE_EXCLUSIVE_CONNECTION` | No | `0` | Passed to Yuanrong `HeteroClient.enable_exclusive_connection`. Use `1` to enable the exclusive connection mode when required by your deployment. |
-| `DS_ENABLE_REMOTE_H2D` | No | `0` | Passed to Yuanrong `HeteroClient.enable_remote_h2d`. Use `1` only when remote host-to-device transfer is enabled in your Datasystem deployment. |
+| `DS_ENABLE_REMOTE_H2D` | No | `0` | Passed to Yuanrong `HeteroClient.enable_remote_h2d`. Use `1` only after the Remote H2D requirements below are met. |
 
 ```bash
 export PYTHONHASHSEED=0
@@ -1190,6 +1188,66 @@ export DS_WORKER_ADDR="${WORKER_IP}:31501"
 export DS_ENABLE_EXCLUSIVE_CONNECTION=0
 export DS_ENABLE_REMOTE_H2D=0
 ```
+
+#### Remote H2D Requirements
+
+Set `DS_ENABLE_REMOTE_H2D=1` only when Remote Host-to-Device transfer is
+enabled and verified in the Yuanrong Datasystem deployment:
+
+* Reserve enough 2 MiB HugeTLB pages before starting the worker. For 40 GiB
+  shared memory, reserve at least 20480 2 MiB huge pages.
+* Start each Datasystem worker with Remote H2D enabled. The worker start
+  command must include `--remote_h2d_device_ids`, `--enable_huge_tlb true`,
+  `--arena_per_tenant 1`, and `--enable_fallocate false`. Using multiple
+  available NPU device IDs is recommended, for example `"0,1,2,3,4,5,6,7"` on
+  an 8-NPU node.
+
+```bash
+dscli start -w \
+  --worker_address "${WORKER_IP}:31501" \
+  --etcd_address "${ETCD_IP}:2379" \
+  --shared_memory_size_mb 40960 \
+  --arena_per_tenant 1 \
+  --enable_huge_tlb true \
+  --enable_fallocate false \
+  --remote_h2d_device_ids "0,1,2,3,4,5,6,7" \
+  --enable_worker_worker_batch_get=true
+```
+
+* Make sure the NPU driver, firmware, and CANN toolkit required by Yuanrong
+  Remote H2D are installed and visible to the worker process. In containers,
+  mount the Ascend driver path, `npu-smi`, `hccn_tool`, `/etc/hccn.conf`,
+  `/etc/ascend_install.info`, and the required `/dev/davinci*` devices.
+* Verify the NPU and RoCE environment before enabling the client flag:
+
+```bash
+# Check the current 2 MiB HugeTLB page size, total count, and free count.
+grep -E "HugePages_Total|HugePages_Free|Hugepagesize" /proc/meminfo
+
+# Optional: check 2 MiB HugeTLB pages on each NUMA node.
+for node in /sys/devices/system/node/node*/hugepages/hugepages-2048kB; do
+  echo "$node total=$(cat "$node/nr_hugepages") free=$(cat "$node/free_hugepages")"
+done
+
+# Check that NPU devices and the driver are visible to the worker environment.
+npu-smi info
+
+# Check that the NPU topology is visible.
+npu-smi info -t topo
+
+# Check optical module detection on the selected local NPU.
+hccn_tool -i <local_npu_id> -optical -g
+
+# Check RoCE physical link status. The expected link status is UP.
+for i in {0..7}; do hccn_tool -i $i -link -g; done
+
+# Check the selected NPU IP address and reachability to the remote NPU.
+hccn_tool -i <local_npu_id> -ip -g
+hccn_tool -i <local_npu_id> -ping -g address <remote_npu_ip>
+```
+
+If these checks fail, keep `DS_ENABLE_REMOTE_H2D=0` and use the default
+Datasystem transfer path.
 
 ### Run AscendStoreConnector with Yuanrong backend
 
