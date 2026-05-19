@@ -456,6 +456,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # dsa c8
         self.use_sparse_c8_indexer = ascend_config.is_sparse_c8_layer(self.layer_name)
+        self.enable_kv_quant_sfa = envs.VLLM_ASCEND_ENABLE_KV_QUANT_SFA
         if self.use_sparse_c8_indexer:
             self.c8_k_cache_dtype = torch.int8
             self.c8_k_scale_cache_dtype = torch.float16
@@ -1054,12 +1055,72 @@ class AscendSFAImpl(MLAAttentionImpl):
             topk_indices_to_cache = topk_indices_to_cache.squeeze(1)
         topk_indices_buffer.copy_(topk_indices_to_cache)
 
+    def _build_kv_quant_sharedkv_cache(self, kv_cache: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        kv_nope = kv_cache[0]
+        kv_rope = kv_cache[1]
+        kv_scale = kv_cache[3] if len(kv_cache) > 3 else None
+        if kv_scale is None:
+            raise RuntimeError("kv_quant_sfa requires k_scale cache at kv_cache[3].")
+        packed_kv = torch.cat([kv_rope.to(torch.bfloat16), kv_nope.to(torch.float16), kv_scale.to(torch.float16)], dim=-1)
+        if packed_kv.shape[-1] < 640:
+            pad_size = 640 - packed_kv.shape[-1]
+            packed_kv = torch.nn.functional.pad(packed_kv, (0, pad_size))
+        return packed_kv
+
     def _execute_sparse_flash_attention_process(
         self, ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
     ):
         block_table = attn_metadata.block_table
         kv = kv_cache[0]
         key_rope = kv_cache[1]
+
+        if self.enable_kv_quant_sfa:
+            if len(kv_cache) < 4:
+                raise RuntimeError("kv_quant_sfa path expects kv_cache=(k_nope, k_rope, k_indexer, k_scale).")
+            logger.info_once(
+                "[SFA kv-quant] enabled for layer %s, kv_nope=%s kv_rope=%s k_scale=%s",
+                self.layer_name,
+                tuple(kv_cache[0].shape),
+                tuple(kv_cache[1].shape),
+                tuple(kv_cache[3].shape),
+            )
+            quant_kv_cache = self._build_kv_quant_sharedkv_cache(kv_cache)
+            metadata = torch.ops._C_ascend.npu_kv_quant_sparse_attn_sharedkv_metadata(
+                num_heads_q=ql_nope.shape[1],
+                num_heads_kv=1,
+                head_dim=ql_nope.shape[-1],
+                kv_quant_mode=1,
+                cu_seqlens_q=actual_seq_lengths_query,
+                seqused_kv=actual_seq_lengths_key,
+                batch_size=actual_seq_lengths_key.numel(),
+                max_seqlen_q=int((actual_seq_lengths_query[1:] - actual_seq_lengths_query[:-1]).max().item()),
+                max_seqlen_kv=int(actual_seq_lengths_key.max().item()),
+                cmp_topk=topk_indices.shape[-1],
+                tile_size=64,
+                rope_head_dim=self.qk_rope_head_dim,
+                cmp_ratio=1,
+                layout_q="TND",
+                layout_kv="PA_ND",
+            )
+            attn_output, _ = torch.ops._C_ascend.npu_kv_quant_sparse_attn_sharedkv(
+                q=torch.cat([q_pe, ql_nope], dim=-1),
+                kv_quant_mode=1,
+                ori_kv=quant_kv_cache,
+                cmp_kv=quant_kv_cache,
+                cmp_sparse_indices=topk_indices.to(torch.int32),
+                ori_block_table=block_table,
+                cmp_block_table=block_table,
+                cu_seqlens_q=actual_seq_lengths_query,
+                seqused_kv=actual_seq_lengths_key,
+                sinks=torch.zeros([1], dtype=torch.float32, device=ql_nope.device),
+                metadata=metadata,
+                tile_size=64,
+                rope_head_dim=self.qk_rope_head_dim,
+                cmp_ratio=1,
+                layout_q="TND",
+                layout_kv="PA_ND",
+            )
+            return attn_output
 
         attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=ql_nope,
