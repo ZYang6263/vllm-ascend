@@ -1,3 +1,5 @@
+import os
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar
 
@@ -63,6 +65,10 @@ if TYPE_CHECKING:
 
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
+
+
+def _profile_dsa_c8() -> bool:
+    return os.getenv("VLLM_ASCEND_PROFILE_DSA_C8", "0") == "1"
 
 
 class AscendSFABackend(AttentionBackend):
@@ -1066,6 +1072,16 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Inputs and outputs may be padded for CUDA graphs
         num_input_tokens = attn_metadata.num_input_tokens
         output_padded = output
+        profile_dsa_c8 = _profile_dsa_c8() and self.enable_dsa_cp and self.use_sparse_c8_indexer
+        profile_marks = []
+
+        def mark(label: str) -> None:
+            if profile_dsa_c8:
+                event = torch.npu.Event(enable_timing=True)
+                event.record()
+                profile_marks.append((label, event))
+
+        mark("start")
 
         # all-gather o_proj weight for prefill stage of PD mix node
         o_proj_full_handle = None
@@ -1087,6 +1103,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 num_input_tokens=num_input_tokens,
             )
             k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
+            mark("after_mlapo_preprocess")
         # native
         else:
             assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
@@ -1101,16 +1118,20 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
             assert self.q_a_layernorm is not None, "q_a_layernorm must be initialized"
             q_c = self.q_a_layernorm(q_c)
+            mark("after_qkv_a")
 
             k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
+            mark("after_indexer_pre")
 
             wait_for_kv_layer_from_connector(layer_name)
+            mark("after_wait_connector")
 
             if self.enable_dsa_cp:
                 assert slot_mapping_cp is not None
                 k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping_cp, attn_metadata)
             else:
                 k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping, attn_metadata)
+            mark("after_exec_kv")
 
             if self.enable_dsa_cp:
                 assert k_pe is not None
@@ -1155,13 +1176,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                         get_tp_group(),
                         async_op=async_op,
                     )
+                mark("after_ag_launch")
 
             ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
             q_pe = self.rope_single(q_pe, cos, sin)
+            mark("after_q_proj_rope")
 
             if self.enable_dsa_cp:
                 if kv_ag_handle is not None:
                     kv_ag_handle.wait()
+                mark("after_ag_wait")
 
                 if self.enable_dsa_cp_with_layer_shard:
                     for layer in self.layer_sharding_kwargs or []:
@@ -1189,8 +1213,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                         value_cache=kv_cache[1],
                         slot_mapping=slot_mapping[: attn_metadata.num_actual_tokens],
                     )
+                    mark("after_reshape_cache")
 
             k_li = self._get_full_kv(k_li, attn_metadata)
+            mark("after_get_full_kv")
 
         if kv_cache is not None:
             if self.is_kv_producer:
@@ -1198,6 +1224,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             torch_npu.npu_scatter_nd_update_(
                 kv_cache[2].view(-1, k_li.shape[-1]), slot_mapping.view(-1, 1), k_li.view(-1, k_li.shape[-1])
             )  # b, s, n, d
+            mark("after_scatter_dsa_k")
             if self.use_sparse_c8_indexer:
                 assert len(kv_cache) == 4
                 assert k_li_scale is not None
@@ -1206,6 +1233,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     slot_mapping.view(-1, 1),
                     k_li_scale.view(-1, k_li_scale.shape[-1]),
                 )
+                mark("after_scatter_scale")
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
 
@@ -1219,12 +1247,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_query=actual_seq_lengths_query,
             actual_seq_lengths_key=actual_seq_lengths_key,
         )
+        mark("after_indexer_post")
 
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
         )
+        mark("after_sparse_attn")
 
         attn_output = self._v_up_proj(attn_output)
+        mark("after_v_up_proj")
         weight_prefetch_method = get_weight_prefetch_method()
         weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
             inputs=self.o_proj.weight,
@@ -1248,7 +1279,27 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_output = result
 
         output[...] = self.o_proj(attn_output)[0]
+        mark("after_o_proj")
 
+        if profile_dsa_c8:
+            save_start = time.perf_counter()
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+        if profile_dsa_c8:
+            save_ms = (time.perf_counter() - save_start) * 1000
+            mark("after_save_connector")
+            if len(profile_marks) > 1:
+                profile_marks[-1][1].synchronize()
+                spans = []
+                for (start_name, start_event), (end_name, end_event) in zip(profile_marks, profile_marks[1:]):
+                    spans.append(f"{start_name}->{end_name}={start_event.elapsed_time(end_event):.3f}ms")
+                logger.warning(
+                    "[DSA_C8_PROFILE] layer=%s state=%s tokens=%s actual=%s save_cpu=%.3fms %s",
+                    layer_name,
+                    attn_metadata.attn_state,
+                    num_input_tokens,
+                    attn_metadata.num_actual_tokens,
+                    save_ms,
+                    " ".join(spans),
+                )
 
         return output_padded
