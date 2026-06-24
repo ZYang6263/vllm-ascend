@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeVar
+from typing import Any, TYPE_CHECKING, TypeVar
 
 import scipy  # type: ignore
 import torch
@@ -62,6 +62,7 @@ from vllm_ascend.utils import (
     get_ascend_device_type,
     get_weight_prefetch_method,
     maybe_trans_nz,
+    parse_layer_idx,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
@@ -70,6 +71,44 @@ if TYPE_CHECKING:
 
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
+
+
+def _get_indexer_types(configs: tuple[Any, ...]) -> Any | None:
+    for config in configs:
+        if config is None:
+            continue
+        indexer_types = getattr(config, "indexer_types", None)
+        if indexer_types is not None:
+            return indexer_types
+    return None
+
+
+def _has_shared_indexer_layers(configs: tuple[Any, ...]) -> bool:
+    indexer_types = _get_indexer_types(configs)
+    if indexer_types is None:
+        return False
+    return any(
+        isinstance(indexer_type, str) and indexer_type.lower() == "shared"
+        for indexer_type in indexer_types
+    )
+
+
+def _is_shared_indexer_layer(configs: tuple[Any, ...], layer_name: str | None) -> bool:
+    if layer_name is None:
+        return False
+    layer_idx = parse_layer_idx(layer_name)
+    indexer_types = _get_indexer_types(configs)
+    if layer_idx is None or indexer_types is None or layer_idx >= len(indexer_types):
+        return False
+    indexer_type = indexer_types[layer_idx]
+    return isinstance(indexer_type, str) and indexer_type.lower() == "shared"
+
+
+def _get_config_bool(configs: tuple[Any, ...], attr: str) -> bool:
+    for config in configs:
+        if config is not None and hasattr(config, attr):
+            return bool(getattr(config, attr))
+    return False
 
 
 class AscendSFABackend(AttentionBackend):
@@ -491,16 +530,20 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         self.local_num_heads = self.num_heads
         self.vllm_config = get_current_vllm_config()
-        self.use_index_cache = self.skip_topk or getattr(
-            self.vllm_config.model_config.hf_config,
+        self.layer_name = kwargs.get("layer_name")
+        hf_config = self.vllm_config.model_config.hf_config
+        hf_text_config = getattr(self.vllm_config.model_config, "hf_text_config", None)
+        config_candidates = (hf_config, hf_text_config)
+        self.skip_topk = self.skip_topk or _is_shared_indexer_layer(config_candidates, self.layer_name)
+        self.index_cache_enabled = _get_config_bool(
+            config_candidates,
             "use_index_cache",
-            False,
-        )
+        ) or _has_shared_indexer_layers(config_candidates)
+        self.use_index_cache = self.skip_topk or self.index_cache_enabled
         self.is_kv_producer = (
             self.vllm_config.kv_transfer_config is not None
             and self.vllm_config.kv_transfer_config.is_kv_producer
         )
-        self.layer_name = kwargs.get("layer_name")
 
         self.has_indexer = self.indexer is not None
         if not self.has_indexer and not self.skip_topk:
@@ -516,7 +559,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
         # indexer param
-        hf_config = self.vllm_config.model_config.hf_config
         if self.has_indexer:
             self.n_head: int = self.indexer.n_head  # 64
             self.head_dim: int = self.indexer.head_dim  # 128
