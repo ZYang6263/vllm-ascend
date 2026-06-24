@@ -62,7 +62,6 @@ from vllm_ascend.utils import (
     get_ascend_device_type,
     get_weight_prefetch_method,
     maybe_trans_nz,
-    parse_layer_idx,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
@@ -91,17 +90,6 @@ def _has_shared_indexer_layers(configs: tuple[Any, ...]) -> bool:
         isinstance(indexer_type, str) and indexer_type.lower() == "shared"
         for indexer_type in indexer_types
     )
-
-
-def _is_shared_indexer_layer(configs: tuple[Any, ...], layer_name: str | None) -> bool:
-    if layer_name is None:
-        return False
-    layer_idx = parse_layer_idx(layer_name)
-    indexer_types = _get_indexer_types(configs)
-    if layer_idx is None or indexer_types is None or layer_idx >= len(indexer_types):
-        return False
-    indexer_type = indexer_types[layer_idx]
-    return isinstance(indexer_type, str) and indexer_type.lower() == "shared"
 
 
 def _get_config_bool(configs: tuple[Any, ...], attr: str) -> bool:
@@ -534,7 +522,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         hf_config = self.vllm_config.model_config.hf_config
         hf_text_config = getattr(self.vllm_config.model_config, "hf_text_config", None)
         config_candidates = (hf_config, hf_text_config)
-        self.skip_topk = self.skip_topk or _is_shared_indexer_layer(config_candidates, self.layer_name)
         self.index_cache_enabled = _get_config_bool(
             config_candidates,
             "use_index_cache",
