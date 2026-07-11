@@ -311,7 +311,11 @@ def quant_apply_mlp(
                 group_list=cumsum_group_list(group_list, group_list_type, 0),
                 weight_scale=_require_single_tensor_for_swiglu_quant(w1_scale, name="w1_scale"),
                 x_scale=pertoken_scale,
-                bias=bias1,
+                bias=(
+                    _require_single_tensor_for_swiglu_quant(bias1, name="bias1")
+                    if bias1 is not None
+                    else None
+                ),
                 use_mxfp_quant=use_mxfp_quant,
                 act_quant_type=act_quant_type,
                 weight_quant_type=weight_quant_type,
@@ -323,7 +327,7 @@ def quant_apply_mlp(
         else:
             w1_scale[0] = w1_scale[0].to(w2_scale[0].dtype)
             # gmm1: gate_up_proj
-            hidden_states = torch_npu.npu_grouped_matmul(
+            gate_up = torch_npu.npu_grouped_matmul(
                 x=[hidden_states],
                 weight=w1,
                 scale=w1_scale,
@@ -339,22 +343,29 @@ def quant_apply_mlp(
                 dispose_tensor(quantized_hidden_states)
             # act_fn: swiglu
             if activation == MoEActivation.SWIGLUSTEP:
-                hidden_states = AscendSwigluStepAndMul.swiglustep_forward(hidden_states, limit=swiglu_limit or 7.0)
-                hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(hidden_states)
+                activated = AscendSwigluStepAndMul.swiglustep_forward(gate_up, limit=swiglu_limit or 7.0)
+                dispose_tensor(gate_up)
+                hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(activated)
+                dispose_tensor(activated)
             elif is_gelu_activation:
-                gate, up = hidden_states.chunk(2, dim=-1)
+                gate, up = gate_up.chunk(2, dim=-1)
                 approximate = "tanh" if activation == MoEActivation.GELU_TANH else "none"
-                hidden_states = torch.nn.functional.gelu(gate, approximate=approximate) * up
-                hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(hidden_states)
+                activated = torch.nn.functional.gelu(gate, approximate=approximate) * up
+                dispose_tensor(gate_up)
+                hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(activated)
+                dispose_tensor(activated)
             elif HAS_TRITON:
                 from vllm_ascend.ops.triton.activation.swiglu_quant import swiglu_quant
 
                 hidden_states, swiglu_out_scale = swiglu_quant(
-                    hidden_states, group_list=group_list, group_list_type=group_list_type
+                    gate_up, group_list=group_list, group_list_type=group_list_type
                 )
+                dispose_tensor(gate_up)
             else:
-                hidden_states = torch_npu.npu_swiglu(hidden_states)
-                hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(hidden_states)
+                activated = torch_npu.npu_swiglu(gate_up)
+                dispose_tensor(gate_up)
+                hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(activated)
+                dispose_tensor(activated)
         before_gmm2_evt = torch.npu.current_stream().record_event()
         # gmm2: down_proj
         hidden_states = DeviceOperator.npu_grouped_matmul_gmm2(

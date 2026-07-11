@@ -89,6 +89,10 @@ class MoEQuantParams:
         return self.quant_type == QuantType.W4A8 and self.is_per_channel_weight
 
     @property
+    def use_w4a8_weight_nz_gmm_swiglu(self) -> bool:
+        return self.quant_type == QuantType.W4A8 and not self.is_per_channel_weight
+
+    @property
     def dispatch_with_quant(self) -> bool:
         return self.quant_type in (
             QuantType.W8A8,
