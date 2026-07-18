@@ -650,8 +650,14 @@ class AscendSFAImpl(MLAAttentionImpl):
         # - C8 indexer cache for lightning indexer.
         # The user-facing switches control these layouts independently, and
         # layers without an indexer only apply the SFA setting.
-        self.enable_sparse_sfa_c8 = ascend_config.enable_sparse_sfa_c8
         self.enable_sparse_li_c8 = self.has_indexer and ascend_config.is_sparse_li_c8_layer(self.layer_name)
+        if ascend_config.enable_sparse_sfa_c8 and ascend_config.enable_sparse_li_c8:
+            # Preserve the original combined-C8 per-layer behavior. Some
+            # indexer layers are excluded from LI C8 by the quant config and
+            # must keep the regular SFA KV layout when both switches are on.
+            self.enable_sparse_sfa_c8 = self.enable_sparse_li_c8 or not self.has_indexer
+        else:
+            self.enable_sparse_sfa_c8 = ascend_config.enable_sparse_sfa_c8
         if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
             if get_ascend_device_type() == AscendDeviceType.A5:
                 self.c8_k_cache_dtype = torch.float8_e4m3fn
@@ -1701,7 +1707,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert k_pe is not None
                 assert k_nope is not None
                 async_op = self.enable_dsa_cp_with_layer_shard or full_gather_o_proj_enabled
-                kv_ag_handles = []
                 # support all_gather kv async for communication calculation overlap
                 if self.enable_sparse_sfa_c8:
                     assert knope_scale is not None
@@ -1725,8 +1730,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                     get_tp_group(),
                     async_op=async_op,
                 )
-                if kv_ag_handle is not None:
-                    kv_ag_handles.append(kv_ag_handle)
 
                 if self.has_indexer and (self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8):
                     assert k_li is not None
@@ -1735,8 +1738,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                         get_tp_group(),
                         async_op=async_op,
                     )
-                    if kv_ag_handle is not None:
-                        kv_ag_handles.append(kv_ag_handle)
                 if self.has_indexer and self.enable_sparse_li_c8:
                     assert k_li_scale is not None
                     k_li_scale, kv_ag_handle = all_gather_async(
@@ -1744,15 +1745,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                         get_tp_group(),
                         async_op=async_op,
                     )
-                    if kv_ag_handle is not None:
-                        kv_ag_handles.append(kv_ag_handle)
 
             ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
             q_pe = self.rope_single(q_pe, cos, sin)
             self._record_dcp_query_gather_context(ql_nope, q_pe, attn_metadata)
 
             if self.enable_dsa_cp:
-                for kv_ag_handle in kv_ag_handles:
+                if kv_ag_handle is not None:
                     kv_ag_handle.wait()
 
                 if self.enable_dsa_cp_with_layer_shard:
