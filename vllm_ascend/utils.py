@@ -1717,7 +1717,7 @@ def kv_cache_spec_uses_sparse_sfa_c8(kv_cache_spec) -> bool:
     from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 
     return isinstance(kv_cache_spec, AscendMLAAttentionSpec) and bool(
-        getattr(kv_cache_spec, "cache_sparse_sfa_c8", False)
+        getattr(kv_cache_spec, "cache_sparse_c8", False)
     )
 
 

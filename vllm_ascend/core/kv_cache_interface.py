@@ -57,7 +57,9 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     scale_dim: int = 0
     scale_dtype: torch.dtype = torch.int8
     sparse_head_dim: tuple[int, ...] | None = None
-    cache_sparse_sfa_c8: bool = False
+    # Keep the original field name for KV transfer metadata compatibility.
+    # LI C8 is represented by its own independent flag.
+    cache_sparse_c8: bool = False
     cache_sparse_li_c8: bool = False
     c8_k_cache_dtype: torch.dtype = field(default_factory=_get_c8_k_cache_dtype)
     c8_k_scale_cache_dtype: torch.dtype = field(default_factory=_get_c8_k_scale_cache_dtype)
@@ -65,7 +67,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
 
     @property
     def page_size_bytes(self) -> int:
-        if self.cache_sparse_sfa_c8:
+        if self.cache_sparse_c8:
             assert self.sparse_head_dim is not None
             assert len(self.sparse_head_dim) == 3
             num_heads_per_page = self.block_size * self.num_kv_heads
@@ -135,7 +137,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
 
         assert self.sparse_head_dim is not None
 
-        if self.cache_sparse_sfa_c8:
+        if self.cache_sparse_c8:
             ckv_head_dim, qk_rope_head_dim, index_k_head_dim = self.sparse_head_dim
             assert qk_rope_head_dim == 0
 
@@ -211,8 +213,8 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         assert len(cache_dtype_str_set) == 1, (
             "All attention layers in the same KV cache group must use the same quantization method."
         )
-        cache_sparse_sfa_c8_set = set(spec.cache_sparse_sfa_c8 for spec in specs)
-        assert len(cache_sparse_sfa_c8_set) == 1, (
+        cache_sparse_c8_set = set(spec.cache_sparse_c8 for spec in specs)
+        assert len(cache_sparse_c8_set) == 1, (
             "All attention layers in the same KV cache group must use the same sparse SFA C8 setting."
         )
         cache_sparse_li_c8_set = set(spec.cache_sparse_li_c8 for spec in specs)
@@ -233,7 +235,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             sparse_head_dim=specs[0].sparse_head_dim,
             dtype=specs[0].dtype,
             cache_dtype_str=cache_dtype_str_set.pop(),
-            cache_sparse_sfa_c8=specs[0].cache_sparse_sfa_c8,
+            cache_sparse_c8=specs[0].cache_sparse_c8,
             cache_sparse_li_c8=specs[0].cache_sparse_li_c8,
             sfa_dcp_replicated_indexer_size=sfa_dcp_replicated_indexer_size_set.pop(),
         )

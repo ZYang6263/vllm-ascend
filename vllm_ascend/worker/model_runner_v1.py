@@ -4921,7 +4921,7 @@ class NPUModelRunner(GPUModelRunner):
                         sparse_head_dim=sparse_head_dim,
                         dtype=self.kv_cache_dtype,
                         cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
-                        cache_sparse_sfa_c8=enable_sparse_sfa_c8_for_layer,
+                        cache_sparse_c8=enable_sparse_sfa_c8_for_layer,
                         cache_sparse_li_c8=enable_sparse_li_c8_for_layer,
                         sfa_dcp_replicated_indexer_size=self.sfa_dcp_replicated_indexer_size,
                     )
