@@ -1706,7 +1706,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.enable_dsa_cp:
                 assert k_pe is not None
                 assert k_nope is not None
-                async_op = self.enable_dsa_cp_with_layer_shard or full_gather_o_proj_enabled
+                # Packed SFA C8 uses separate heterogeneous gathers for KV and
+                # indexer data. Keep them synchronous so the P-side cache write
+                # cannot race the first lazy communication initialization.
+                async_op = (
+                    self.enable_dsa_cp_with_layer_shard or full_gather_o_proj_enabled
+                ) and not self.enable_sparse_sfa_c8
                 # support all_gather kv async for communication calculation overlap
                 if self.enable_sparse_sfa_c8:
                     assert knope_scale is not None
