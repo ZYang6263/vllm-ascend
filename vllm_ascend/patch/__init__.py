@@ -48,6 +48,35 @@
 #    Future Plan:
 #       Remove this patch when vLLM merge the PR.
 #
+# ** 2. File: platform/patch_compute_aware_routing.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.engine.core_client.DPLBAsyncMPClient`
+#   2. `vllm.v1.engine.core.EngineCore.__init__`
+#   3. `vllm.v1.engine.core.EngineCoreProc.run_engine_core`
+#   4. The configured Scheduler's `update_from_output`
+#    Why:
+#       Upstream internal DP routing primarily compares request counts and KV
+#       pressure. In PD-mixed DP+EP deployments, equal request counts can hide
+#       very different prompt and decode workloads, increasing step skew and
+#       EP collective waiting.
+#    How:
+#       When explicitly enabled, each API server tracks the Prompt tokens of
+#       requests it routed to every DP engine. After each completed Prefill
+#       chunk, the Engine sends the originating API an absolute per-request
+#       remaining-token update over the existing EngineCore output path. The
+#       API consumes this internal output and combines the resulting Prefill
+#       debt with the existing Coordinator request-count/KV snapshot.
+#    Related PR (if no, explain why):
+#       No. This is an initial shadow-capable prototype used to validate the
+#       Prefill-only workload model before proposing a generic upstream routing
+#       interface. The Coordinator protocol and EngineCore msgspec schema are
+#       unchanged; a reserved EngineCoreOutput carries plugin-internal progress
+#       and is removed by the API-side patch.
+#    Future Plan:
+#       Propose an upstream `DPRoutingPolicy` interface and, if multi-API-server
+#       accuracy is required, a typed `DPRoutingStats` payload. Replace the
+#       reserved control output with a typed upstream extension point.
+#
 # ** 3. File: platform/patch_distributed.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `torch.distributed.all_reduce`, `torch.distributed.broadcast`

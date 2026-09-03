@@ -27,6 +27,7 @@ from vllm_ascend.ascend_config import (
     AscendCompilationConfig,
     AscendConfig,
     AscendFusionConfig,
+    ComputeAwareRoutingConfig,
     DynamicSpecConfig,
     DyntraLBConfig,
     EplbConfig,
@@ -658,6 +659,7 @@ class TestSchedulerConfig(TestBase):
         self.assertFalse(config.recompute_scheduler_enable)
         self.assertFalse(config.short_request_first_config.enabled)
         self.assertFalse(config.profiling_chunk_config.enabled)
+        self.assertFalse(config.compute_aware_routing_config.enabled)
         self.assertFalse(hasattr(config, "_additional_config"))
         self.assertFalse(hasattr(config, "_balance_env_value"))
 
@@ -727,6 +729,26 @@ class TestSchedulerConfig(TestBase):
         self.assertEqual(config.short_request_first_config.long_max_wait_ms, 2000.0)
         self.assertTrue(config.profiling_chunk_config.enabled)
         self.assertFalse(config.profiling_chunk_config.need_timing)
+
+    def test_compute_aware_routing_nested_config(self):
+        config = SchedulerConfig.from_additional_config(
+            {
+                "scheduler_config": {
+                    "compute_aware_routing_config": {
+                        "enabled": True,
+                        "shadow_mode": False,
+                    }
+                }
+            }
+        )
+
+        routing = config.compute_aware_routing_config
+        self.assertTrue(routing.enabled)
+        self.assertFalse(routing.shadow_mode)
+
+    def test_compute_aware_routing_rejects_unknown_option(self):
+        with self.assertRaises(ValueError):
+            ComputeAwareRoutingConfig(**{"unknown_option": True})
 
     @patch("vllm_ascend.ascend_config.logger.warning_once")
     def test_legacy_top_level_config_warns_and_remains_supported(self, mock_warning_once):

@@ -901,6 +901,11 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
                 "PD-disaggregated mode (kv_role='kv_producer'/'kv_consumer')."
             )
 
+    _validate_compute_aware_routing_config(
+        vllm_config,
+        getattr(scheduler_extension_config, "compute_aware_routing_config", None),
+    )
+
     _validate_kv_load_failure_policy(vllm_config)
 
     # short_request_first_config: requires fcfs policy and excludes
@@ -994,6 +999,38 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
                 dyntra_lb_enabled=dyntra_lb_config.enabled,
             )
             vllm_config.scheduler_config = recompute_scheduler_config
+
+
+def _validate_compute_aware_routing_config(vllm_config: VllmConfig, routing_config) -> None:
+    # The identity check also keeps older third-party test doubles that do not
+    # define this newly added config from becoming accidentally enabled via a
+    # truthy MagicMock attribute.
+    if getattr(routing_config, "enabled", False) is not True:
+        return
+
+    parallel_config = vllm_config.parallel_config
+    if parallel_config.data_parallel_size <= 1:
+        raise ValueError("Compute-aware routing requires data_parallel_size > 1.")
+    if getattr(parallel_config, "enable_expert_parallel", False) is not True:
+        raise ValueError("Compute-aware routing currently requires expert parallelism.")
+    if getattr(parallel_config, "data_parallel_rank_local", None) is not None:
+        raise ValueError(
+            "Compute-aware routing currently supports online asynchronous "
+            "serving and is not supported by application-level offline DP."
+        )
+    if parallel_config.data_parallel_external_lb:
+        raise ValueError(
+            "Compute-aware routing requires vLLM internal or hybrid DP load "
+            "balancing and is not supported with external DP load balancing."
+        )
+    kv_transfer_config = vllm_config.kv_transfer_config
+    kv_role = getattr(kv_transfer_config, "kv_role", None)
+    if kv_transfer_config is not None and kv_role != "kv_both":
+        raise ValueError(
+            "Compute-aware routing only supports PD-mixed mode "
+            "(kv_role='kv_both' or no kv_transfer_config), and is not "
+            "supported in PD-disaggregated mode."
+        )
 
 
 def _validate_kv_load_failure_policy(vllm_config: VllmConfig) -> None:

@@ -15,6 +15,7 @@ from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.platform import (
     NPUPlatform,
     _setup_compile_backend,
+    _validate_compute_aware_routing_config,
     _validate_eplb_config,
     _validate_sfa_dcp_kv_sp,
 )
@@ -26,6 +27,69 @@ from vllm_ascend.utils import (
 
 
 class TestNPUPlatform(TestBase):
+    def test_compute_aware_routing_rejects_unsupported_modes(self):
+        cases = [
+            (1, True, False, None, "data_parallel_size > 1"),
+            (2, False, False, None, "expert parallelism"),
+            (2, True, True, None, "external DP load balancing"),
+            (2, True, False, "kv_producer", "PD-mixed mode"),
+            (2, True, False, "kv_consumer", "PD-mixed mode"),
+        ]
+        for dp_size, expert_parallel, external_lb, kv_role, error in cases:
+            with self.subTest(
+                dp_size=dp_size,
+                external_lb=external_lb,
+                kv_role=kv_role,
+            ):
+                vllm_config = SimpleNamespace(
+                    parallel_config=SimpleNamespace(
+                        data_parallel_size=dp_size,
+                        enable_expert_parallel=expert_parallel,
+                        data_parallel_external_lb=external_lb,
+                        data_parallel_rank_local=None,
+                    ),
+                    kv_transfer_config=(None if kv_role is None else SimpleNamespace(kv_role=kv_role)),
+                )
+
+                with pytest.raises(ValueError, match=error):
+                    _validate_compute_aware_routing_config(
+                        vllm_config,
+                        SimpleNamespace(enabled=True),
+                    )
+
+    def test_compute_aware_routing_accepts_internal_pd_mixed(self):
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                data_parallel_size=2,
+                enable_expert_parallel=True,
+                data_parallel_external_lb=False,
+                data_parallel_rank_local=None,
+            ),
+            kv_transfer_config=None,
+        )
+
+        _validate_compute_aware_routing_config(
+            vllm_config,
+            SimpleNamespace(enabled=True),
+        )
+
+    def test_compute_aware_routing_rejects_application_level_offline_dp(self):
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                data_parallel_size=2,
+                enable_expert_parallel=True,
+                data_parallel_external_lb=False,
+                data_parallel_rank_local=0,
+            ),
+            kv_transfer_config=None,
+        )
+
+        with pytest.raises(ValueError, match="application-level offline DP"):
+            _validate_compute_aware_routing_config(
+                vllm_config,
+                SimpleNamespace(enabled=True),
+            )
+
     @staticmethod
     def mock_vllm_config():
         mock_vllm_config = MagicMock()
@@ -79,6 +143,7 @@ class TestNPUPlatform(TestBase):
         mock_ascend_config.scheduler_config.short_request_first_config.enabled = False
         mock_ascend_config.scheduler_config.profiling_chunk_config.enabled = False
         mock_ascend_config.scheduler_config.dyntra_lb_config.enabled = False
+        mock_ascend_config.scheduler_config.compute_aware_routing_config.enabled = False
         mock_ascend_config.update_compile_ranges_split_points = MagicMock()
         return mock_ascend_config
 

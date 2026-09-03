@@ -51,7 +51,7 @@ The following table lists additional configuration options available in vLLM Asc
 | `finegrained_tp_config`             | dict | `{}`    | Configuration options for module tensor parallelism                                                       |
 | `ascend_compilation_config`         | dict | `{}`    | Configuration options for ascend compilation                                                              |
 | `eplb_config`                       | dict | `{}`    | Runner-specific EPLB extensions. See [Expert Parallelism Load Balancer](../feature_guide/expert_parallelism_load_balancer.md). |
-| `scheduler_config`                  | dict | `{}`    | Configuration options for Ascend scheduler extensions, including balance scheduling, recompute scheduling, DyntraLB, ShortRequestFirst, and dynamic chunked pipeline parallel. |
+| `scheduler_config`                  | dict | `{}`    | Configuration options for Ascend scheduler extensions, including balance scheduling, compute-aware DP routing, recompute scheduling, DyntraLB, ShortRequestFirst, and dynamic chunked pipeline parallel. |
 | `refresh`                           | bool | `false` | Whether to refresh global Ascend configuration content. This is usually used by rlhf or ut/e2e test case. |
 | `dump_config`                       | dict | `None`  | Inline msprobe dump configuration. vLLM-Ascend will materialize it to a temporary JSON file and pass that file to the debugger. |
 | `dump_config_path`                  | str  | `None`  | Configuration file path for msprobe dump (compatible legacy option).                                      |
@@ -146,6 +146,40 @@ The legacy top-level `enable_balance_scheduling`, `recompute_scheduler_enable`, 
 | `short_request_first_config` | dict | `{}` | Configuration options for ShortRequestFirst prefill scheduling on FCFS synchronous or asynchronous, PD-prefill (P), or PD-mixed nodes. |
 | `batch_job_sched_config` | dict | `{}` | Configuration options for the batch-job-aware scheduler. See [Batch-Job-Aware Scheduler](../feature_guide/batch_job_aware_scheduler.md) for details. |
 | `dyntra_lb_config` | dict | `{}` | Configuration options for DyntraLB load balancing on PD-disaggregated decode nodes. |
+| `compute_aware_routing_config` | dict | `{}` | Experimental Prefill-aware entry routing for internal DP load balancing in PD-mixed serving. |
+
+**scheduler_config.compute_aware_routing_config**
+
+The initial compute-aware policy models only outstanding Prefill work. The API
+records the Prompt length of each request it routes, and the selected Engine
+directly reports absolute remaining Prefill tokens after each completed chunk.
+The API combines that debt with vLLM's unchanged Coordinator request-count/
+KV-pressure snapshot. It changes only the destination of new requests;
+continuous batching inside each DP engine is unchanged.
+
+The initial implementation supports internal or hybrid DP load balancing with
+`data_parallel_size > 1` and expert parallelism in PD-mixed mode. External DP load balancing and
+P/D-disaggregated producer/consumer nodes are rejected at startup. Multimodal
+and pooling requests use the upstream routing policy. `shadow_mode` is enabled
+by default and should be used before active routing.
+
+```bash
+vllm serve MODEL \
+  --data-parallel-size 2 \
+  --enable-expert-parallel \
+  --additional-config '{"scheduler_config":{"compute_aware_routing_config":{"enabled":true,"shadow_mode":true}}}'
+```
+
+| Name | Type | Default | Description |
+| ---- | ---- | ------- | ----------- |
+| `enabled` | bool | `False` | Enable Prefill-aware DP routing and direct Engine-to-API chunk progress. |
+| `shadow_mode` | bool | `True` | Calculate and log Prefill-aware choices while retaining the upstream destination. Set to `False` only after shadow validation. |
+
+There are no workload weights in the initial policy. Outstanding Prefill
+tokens are normalized by vLLM's `max_num_batched_tokens`, while the existing
+request-count and KV-pressure terms remain unchanged. See the
+[compute-aware routing design](../../developer_guide/Design_Documents/compute_aware_dp_routing.md)
+for the model, fallback behavior, limitations, and upstream plan.
 
 **scheduler_config.profiling_chunk_config**
 
