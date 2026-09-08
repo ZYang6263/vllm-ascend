@@ -449,6 +449,7 @@ class TestAscendSFAMetadata(TestBase):
     def test_ascend_sfa_metadata_default(self):
         num_actual_tokens = 100
         slot_mapping = torch.randn(100, 4, 1024)
+        positions = torch.arange(100)
         seq_lens = torch.tensor([30, 50])
         cum_query_lens = torch.tensor([0, 30, 80])
         block_table = torch.randint(0, 100, (100, 4))
@@ -466,6 +467,7 @@ class TestAscendSFAMetadata(TestBase):
         metadata = AscendSFAMetadata(
             num_actual_tokens=num_actual_tokens,
             slot_mapping=slot_mapping,
+            positions=positions,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens,
             cum_query_lens=cum_query_lens,
@@ -480,6 +482,7 @@ class TestAscendSFAMetadata(TestBase):
 
         self.assertEqual(metadata.num_actual_tokens, num_actual_tokens)
         self.assertIs(metadata.slot_mapping, slot_mapping)
+        self.assertIs(metadata.positions, positions)
         self.assertTrue(torch.equal(metadata.seq_lens, seq_lens))
         self.assertTrue(torch.equal(metadata.cum_query_lens, cum_query_lens))
         self.assertIs(metadata.block_table, block_table)
