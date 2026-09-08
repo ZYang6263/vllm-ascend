@@ -256,6 +256,7 @@ class AscendConfig:
             "enable_kv_nz": false,
             "enable_mc2_hierarchy_comm": false,
             "enable_reduce_sample": false,
+            "enable_sfa_kv_cache_prefetch": false,
             "enable_dsa_cp": false,
             "enable_force_eplb": false,
             "enable_pcp_o_proj_weight_sharding": false,
@@ -391,6 +392,7 @@ class AscendConfig:
     enable_kv_nz: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_reduce_sample: bool = False
+    enable_sfa_kv_cache_prefetch: bool = False
     enable_dsa_cp: bool = False
     enable_force_eplb: bool = False
     enable_pcp_o_proj_weight_sharding: bool = False

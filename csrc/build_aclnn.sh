@@ -139,6 +139,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "k2q_csr"
         "msa_index_score"
         "fused_sparse_attention_overlap"
+        "sparse_kv_gather"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
@@ -196,6 +197,9 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "k2q_csr"
         "msa_index_score"
         "fused_sparse_attention_overlap"
+        "sparse_kv_gather"
+        "sparse_kv_gather_group"
+        "sparse_kv_patch"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend910_93"
@@ -235,6 +239,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "k2q_csr"
         "sparse_attention_score"
         "mla_prolog_v3"
+        "sparse_kv_gather"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
