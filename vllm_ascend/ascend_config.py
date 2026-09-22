@@ -326,6 +326,7 @@ class AscendConfig:
             "enable_kv_nz": false,
             "enable_mc2_hierarchy_comm": false,
             "enable_reduce_sample": false,
+            "enable_sfa_kv_cache_prefetch": false,
             "enable_dsa_cp": false,
             "sfa_dcp_force_tmajor_restore": false,
             "enable_force_eplb": false,
@@ -462,6 +463,8 @@ class AscendConfig:
     enable_kv_nz: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_reduce_sample: bool = False
+    # Prefetch shared-index layers' sparse KV into contiguous decode buffers.
+    enable_sfa_kv_cache_prefetch: bool = False
     enable_dsa_cp: bool = False
     sfa_dcp_force_tmajor_restore: bool = False
     enable_force_eplb: bool = False
