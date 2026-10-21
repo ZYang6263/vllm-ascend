@@ -368,6 +368,7 @@ def test_prepare_attn_keeps_actual_counts_separate_from_padding(mock_build_attn_
     assert kwargs["num_reqs"] == graph_requests
     assert kwargs["num_tokens"] == graph_requests * (num_spec + 1)
     model_metadata = kwargs["model_specific_attn_metadata"]
+    assert model_metadata.uniform_spec_decode == (num_spec > 0 and graph_mode == CUDAGraphMode.FULL)
     if num_spec:
         assert model_metadata.num_decode_draft_tokens_cpu.tolist() == [num_spec] * graph_requests
         assert model_metadata.num_accepted_tokens.tolist() == [2, 3] + [1] * (graph_requests - 2)
@@ -416,6 +417,7 @@ def test_prepare_attn_classifies_one_token_prompt_tails(mock_build_attn_metadata
         kv_cache_config=MagicMock(),
     )
     metadata = mock_build_attn_metadata.call_args.kwargs["model_specific_attn_metadata"]
+    assert not metadata.uniform_spec_decode
     assert metadata.is_prefilling.tolist() == [False, True, False]
     expected_drafts = num_draft_tokens if num_draft_tokens else -1
     assert metadata.num_decode_draft_tokens_cpu.tolist() == [expected_drafts, -1, expected_drafts]

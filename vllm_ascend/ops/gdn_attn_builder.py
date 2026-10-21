@@ -38,6 +38,7 @@ from vllm_ascend.ops.triton.fla.utils import (
     prepare_final_chunk_indices,
     prepare_update_chunk_offsets,
 )
+from vllm_ascend.ops.triton.v2.mamba.gdn_metadata import prepare_gdn_spec_metadata
 
 _GDN_CHUNK_SIZE = 64
 # Keep this aligned with solve_tril.LARGE_BLOCK_T in ops/triton/fla/solve_tril.py.
@@ -1045,6 +1046,62 @@ class AscendGDNHostMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         if self._spec_conv_indices is not None:
             self._spec_conv_indices[:graph_batch_size].fill_(PAD_SLOT_ID)
 
+    def _build_uniform_spec_decode(
+        self,
+        m: CommonAttentionMetadata,
+        num_accepted_tokens: torch.Tensor,
+        num_actual_reqs: int,
+    ) -> GDNAttentionMetadata:
+        # V2 has already classified this batch from its CPU scheduling arrays.
+        # Keep the buffers used by the generic capture path, but materialize
+        # their contents in one launch instead of per-field gathers and copies.
+        num_tokens = num_actual_reqs * (self.num_spec + 1)
+        prepare_gdn_spec_metadata[(m.num_reqs,)](
+            m.block_table_tensor,
+            m.seq_lens,
+            num_accepted_tokens,
+            self.spec_state_indices_tensor,
+            self._spec_conv_indices,
+            self.spec_sequence_masks,
+            self.spec_query_start_loc,
+            self.spec_actual_seq_lengths,
+            self.num_accepted_tokens,
+            self.spec_token_indx,
+            NUM_ACTUAL_REQS=num_actual_reqs,
+            NUM_GRAPH_REQS=m.num_reqs,
+            QUERY_LEN=self.num_spec + 1,
+            BLOCK_SIZE=self.kv_cache_spec.block_size,
+            BLOCK_TABLE_STRIDE=m.block_table_tensor.stride(0),
+            PAD_BLOCK_ID=self._SPEC_GRAPH_PAD_SLOT_ID,
+            BLOCK=1 << self.num_spec.bit_length(),
+        )
+        metadata = GDNAttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_spec_decodes=num_actual_reqs,
+            num_spec_decode_tokens=num_tokens,
+            num_actual_tokens=m.num_actual_tokens,
+            spec_state_indices_tensor=self.spec_state_indices_tensor[: m.num_reqs],
+            spec_sequence_masks=self.spec_sequence_masks[: m.num_reqs],
+            spec_query_start_loc=self.spec_query_start_loc[: m.num_reqs + 1],
+            num_accepted_tokens=self.num_accepted_tokens[: m.num_reqs],
+            spec_token_indx=self.spec_token_indx[:num_tokens],
+            non_spec_token_indx=self.non_spec_token_indx[:0],
+        )
+        metadata.spec_decode_metadata = GDNSpecDecodeMetadata(
+            spec_causal_conv1d=GDNSpecCausalConv1dMetadata(
+                query_start_loc=metadata.spec_query_start_loc,
+                cache_indices=self._spec_conv_indices[: m.num_reqs],
+                num_accepted_tokens=metadata.num_accepted_tokens,
+            ),
+            actual_seq_lengths=self.spec_actual_seq_lengths[: m.num_reqs + 1],
+        )
+        metadata.non_spec_prefill_metadata = None
+        metadata.non_spec_decode_metadata = None
+        return metadata
+
     def build(
         self,
         common_prefix_len: int,
@@ -1053,8 +1110,25 @@ class AscendGDNHostMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
         num_actual_reqs: int | None = None,
+        uniform_spec_decode: bool = False,
     ) -> GDNAttentionMetadata:
         self._ensure_conv_index_buffers()
+        if (
+            uniform_spec_decode
+            and self.use_full_cuda_graph
+            and self.use_spec_decode
+            and self._USE_COMMON_KERNEL_METADATA
+            and self._spec_conv_indices is not None
+            and self.vllm_config.cache_config.mamba_cache_mode == "align"
+            and self.kv_cache_spec.num_speculative_blocks == self.num_spec
+            and num_accepted_tokens is not None
+            and num_actual_reqs is not None
+            and 0 < num_actual_reqs <= common_attn_metadata.num_reqs
+            and common_attn_metadata.num_actual_tokens == num_actual_reqs * (self.num_spec + 1)
+            and common_attn_metadata.block_table_tensor.stride(1) == 1
+            and self._can_pad_spec_decode(common_attn_metadata.num_reqs, common_attn_metadata.num_actual_tokens)
+        ):
+            return self._build_uniform_spec_decode(common_attn_metadata, num_accepted_tokens, num_actual_reqs)
         metadata = super().build(
             common_prefix_len,
             common_attn_metadata,

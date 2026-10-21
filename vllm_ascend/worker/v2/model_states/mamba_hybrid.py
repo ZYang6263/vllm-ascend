@@ -37,6 +37,7 @@ from vllm.v1.worker.mamba_utils import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend.ops.gdn_attn_builder import AscendGDNHostMetadataBuilder
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
@@ -44,6 +45,17 @@ from vllm_ascend.worker.v2.model_states.default import AscendModelState
 # Copy block size used by the upstream fused mamba kernels.
 _COPY_BLOCK_SIZE = 1024
 _PREPROCESS_BLOCK_SIZE = 256
+
+
+@dataclass
+class AscendMambaHybridAttnMetadata(MambaHybridAttnMetadata):
+    uniform_spec_decode: bool = False
+
+    def get_extra_attn_kwargs(self, attn_metadata_builder: Any, num_reqs: int) -> dict[str, Any]:
+        kwargs = super().get_extra_attn_kwargs(attn_metadata_builder, num_reqs)
+        if self.uniform_spec_decode and isinstance(attn_metadata_builder, AscendGDNHostMetadataBuilder):
+            kwargs["uniform_spec_decode"] = True
+        return kwargs
 
 
 @dataclass
@@ -309,6 +321,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
 
         num_accepted_tokens = None
         num_decode_draft_tokens_cpu = None
+        uniform_spec_decode = False
         if not for_capture and self.vllm_config.num_speculative_tokens > 0:
             num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
             num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[input_batch.idx_mapping]
@@ -323,6 +336,16 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
                     num_draft_tokens_per_req,
                     -1,
                 )
+                # Classify once per step for all GDN groups, using scheduler
+                # arrays only. Capture and mixed/variable-width batches keep
+                # the generic builder; it also owns the stable graph buffers.
+                uniform_spec_decode = bool(
+                    cudagraph_mode == CUDAGraphMode.FULL
+                    and input_batch.num_reqs > 0
+                    and not is_prefilling_np.any()
+                    and spec_decode_mask.all()
+                    and np.all(num_draft_tokens_per_req == self.vllm_config.num_speculative_tokens)
+                )
                 if cudagraph_mode == CUDAGraphMode.FULL and num_reqs > input_batch.num_reqs and spec_decode_mask.all():
                     padded_query_lens = np.diff(input_batch.query_start_loc_np[: num_reqs + 1])[input_batch.num_reqs :]
                     expected_query_len = self.vllm_config.num_speculative_tokens + 1
@@ -334,10 +357,11 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
                         num_decode_draft_tokens_np[input_batch.num_reqs :] = padded_query_lens - 1
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
 
-        model_specific_metadata = MambaHybridAttnMetadata(
+        model_specific_metadata = AscendMambaHybridAttnMetadata(
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            uniform_spec_decode=uniform_spec_decode,
         )
         # The Mamba model state builds its own complete attention metadata.
         # The optional argument is accepted to match AscendModelState's API.
