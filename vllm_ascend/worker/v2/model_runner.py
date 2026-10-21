@@ -254,6 +254,7 @@ class NPUModelRunner(GPUModelRunner):
         # NOTE: In GPUModelRunner, decode_query_len is initialized in load_model(),
         # +1 is hardcoded here but not in vllm.
         self.decode_query_len = self.num_speculative_steps + 1
+        self._uniform_decode_token_count: int | None = None
         # Set _mc2_tokens_capacity and _reserved_mc2_mask for MoE communication optimization.
         # TODO: remove set_cos_and_sin (together with update_cos_sin) when mla can properly handle cos/sin internally
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.decode_query_len, self.dtype, self.device)
@@ -812,6 +813,10 @@ class NPUModelRunner(GPUModelRunner):
                     int(batch_state.num_scheduled_tokens.max()),
                     batch_state.decode_graph_eligible,
                 )
+        # gather_batch_req_state and prepare_inputs run sequentially per step.
+        # Preserve the actual batch classification: a varlen graph descriptor
+        # need not retain it. Dummy/capture batches keep their own default None.
+        self._uniform_decode_token_count = uniform_token_count if batch_state is not None else None
         return batch_state, uniform_token_count
 
     def _check_finegrained_tp_graph_step(self, cg_mode: CUDAGraphMode) -> None:
@@ -1073,6 +1078,8 @@ class NPUModelRunner(GPUModelRunner):
             # extra attributes for ascend npus.
             seq_lens_np=self.input_buffers.seq_lens_np,
             attn_state=attn_state,
+            # Compaction can invalidate the scheduler's uniform query lengths.
+            uniform_token_count=self._uniform_decode_token_count if not adaptive_verification_active else None,
         )
         # vLLM main (#57980) dropped the module-level maybe_partition_pcp_batch
         # helper; PCPManager.partition_batch now takes the batch descriptor.
