@@ -37,6 +37,7 @@ from vllm.v1.worker.mamba_utils import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend.ops.gdn_attn_builder import AscendGDNHostMetadataBuilder
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
@@ -44,6 +45,21 @@ from vllm_ascend.worker.v2.model_states.default import AscendModelState
 # Copy block size used by the upstream fused mamba kernels.
 _COPY_BLOCK_SIZE = 1024
 _PREPROCESS_BLOCK_SIZE = 256
+
+
+@dataclass
+class AscendMambaHybridAttnMetadata(MambaHybridAttnMetadata):
+    # Actual uniform decode width for FULL replay, independent of graph padding.
+    # None keeps capture, mixed and compacted batches on generic preparation.
+    uniform_decode_query_len: int | None = None
+
+    def get_extra_attn_kwargs(self, attn_metadata_builder: Any, num_reqs: int) -> dict[str, Any]:
+        kwargs = super().get_extra_attn_kwargs(attn_metadata_builder, num_reqs)
+        if self.uniform_decode_query_len is not None and isinstance(
+            attn_metadata_builder, AscendGDNHostMetadataBuilder
+        ):
+            kwargs["uniform_decode_query_len"] = self.uniform_decode_query_len
+        return kwargs
 
 
 @dataclass
@@ -292,7 +308,8 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
     ) -> dict[str, Any]:
         # Match the upstream Mamba contract without enabling DBO.
         assert ubatch_idx == 0, "DBO is not supported on Ascend"
-        if cudagraph_mode == CUDAGraphMode.FULL:
+        full_graph = cudagraph_mode == CUDAGraphMode.FULL
+        if full_graph:
             num_reqs = input_batch.num_reqs_after_padding
             num_tokens = input_batch.num_tokens_after_padding
         else:
@@ -309,6 +326,9 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
 
         num_accepted_tokens = None
         num_decode_draft_tokens_cpu = None
+        uniform_decode_query_len = None
+        if not for_capture and full_graph and input_batch.uniform_token_count == 1:
+            uniform_decode_query_len = 1
         if not for_capture and self.vllm_config.num_speculative_tokens > 0:
             num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
             num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[input_batch.idx_mapping]
@@ -323,21 +343,28 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
                     num_draft_tokens_per_req,
                     -1,
                 )
-                if cudagraph_mode == CUDAGraphMode.FULL and num_reqs > input_batch.num_reqs and spec_decode_mask.all():
-                    padded_query_lens = np.diff(input_batch.query_start_loc_np[: num_reqs + 1])[input_batch.num_reqs :]
+                # Reuse the runner's decode classification and uniform width.
+                # The existing mask also verifies that every row has drafts
+                # and exactly one non-draft token; no second draft-width scan.
+                if full_graph and spec_decode_mask.all():
                     expected_query_len = self.vllm_config.num_speculative_tokens + 1
-                    if np.all(padded_query_lens == expected_query_len):
-                        # Full graph capture represents every padded request as
-                        # a speculative decode request. Keep replay on the same
-                        # pure-spec GDN path so its persistent state metadata is
-                        # refreshed before graph replay.
-                        num_decode_draft_tokens_np[input_batch.num_reqs :] = padded_query_lens - 1
+                    if input_batch.uniform_token_count == expected_query_len:
+                        uniform_decode_query_len = input_batch.uniform_token_count
+                    if num_reqs > input_batch.num_reqs:
+                        padded_query_lens = np.diff(input_batch.query_start_loc_np[: num_reqs + 1])[
+                            input_batch.num_reqs :
+                        ]
+                        if np.all(padded_query_lens == expected_query_len):
+                            # Match capture's full-width dummy queries; GDN
+                            # refreshes their persistent inputs before replay.
+                            num_decode_draft_tokens_np[input_batch.num_reqs :] = padded_query_lens - 1
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
 
-        model_specific_metadata = MambaHybridAttnMetadata(
+        model_specific_metadata = AscendMambaHybridAttnMetadata(
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            uniform_decode_query_len=uniform_decode_query_len,
         )
         # The Mamba model state builds its own complete attention metadata.
         # The optional argument is accepted to match AscendModelState's API.

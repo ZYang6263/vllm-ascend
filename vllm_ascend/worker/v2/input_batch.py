@@ -82,6 +82,9 @@ class AscendInputBatch(InputBatch):
     attn_state: AscendAttentionState | None = None
     is_dummy: bool = False
     is_cpp_profile: bool = False
+    # Actual batch classification from the runner, before graph padding.
+    # None for mixed/variable-width batches, capture and adaptive compaction.
+    uniform_token_count: int | None = None
 
     @staticmethod
     def _prepare_cpp_profile_dummy(

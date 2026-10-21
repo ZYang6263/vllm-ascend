@@ -54,6 +54,7 @@ def _make_runner(need_timing: bool = True):
     runner._debugger_started = False
     runner.attn_groups = []
     runner.adaptive_verification = None
+    runner._uniform_decode_token_count = None
     runner.input_buffers = SimpleNamespace(dummy_num_tokens=None)
     runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE)
     runner.use_fia = False
@@ -237,6 +238,17 @@ def test_pd_decode_preserves_dummy_batch():
     runner.vllm_config.kv_transfer_config = SimpleNamespace(is_kv_consumer=True, is_kv_producer=False)
     with patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(None, 4)):
         assert runner.gather_batch_req_state(SimpleNamespace(), True) == (None, 4)
+
+
+def test_uniform_decode_classification_is_refreshed_each_step():
+    runner = _make_runner()
+    batch = _make_batch_state([64, 64], [4, 4], [64, 64])
+    # A mixed step and a dummy step must not inherit the previous width.
+    results = [(batch, 4), (batch, None), (batch, 1), (None, 4)]
+    with patch.object(GPUModelRunner, "gather_batch_req_state", side_effect=results):
+        for state, width in results:
+            assert runner.gather_batch_req_state(SimpleNamespace(), state is None) == (state, width)
+            assert runner._uniform_decode_token_count == (width if state is not None else None)
 
 
 def test_capture_model_uses_ascend_context_and_encoder_update_stream():
@@ -1602,6 +1614,8 @@ def _run_prepare_inputs(
         prepared = runner.prepare_inputs(scheduler_output, batch_req_state, batch_desc, 0)
         assert make_batch.call_args.kwargs["decode_graph_eligible"] == batch_req_state.decode_graph_eligible
         assert make_batch.call_args.kwargs["prefill_runs_as_decode_np"] is batch_req_state.prefill_runs_as_decode_np
+        expected_uniform = runner._uniform_decode_token_count if runner.adaptive_verification is None else None
+        assert make_batch.call_args.kwargs["uniform_token_count"] == expected_uniform
         if vllm_version_is("0.31.0"):
             assert make_batch.call_args.kwargs["max_seq_len_np"] is batch_req_state.max_seq_len_np
         else:
@@ -1617,6 +1631,16 @@ def test_prepare_inputs_common_path():
     assert out is partitioned
     runner.eplb.set_batch_phase.assert_called_once_with(True)
     np.testing.assert_array_equal(runner.input_buffers.seq_lens_cpu[:2], np.array([3, 4], dtype=np.int32))
+
+
+def test_prepare_inputs_keeps_actual_uniform_width_when_graph_descriptor_has_none():
+    runner, scheduler_output, batch_req_state, batch_desc = _prepare_inputs_runner()
+    runner._uniform_decode_token_count = 2
+    batch_req_state.has_prefill = False
+    batch_req_state.decode_graph_eligible = True
+    batch_req_state.is_prefilling_np[:] = False
+    assert batch_desc.uniform_token_count is None
+    _run_prepare_inputs(runner, scheduler_output, batch_req_state, batch_desc)
 
 
 @pytest.mark.parametrize("num_spec_tokens", [0, 1, 5])
