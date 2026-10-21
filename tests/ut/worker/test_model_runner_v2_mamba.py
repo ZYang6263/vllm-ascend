@@ -320,7 +320,10 @@ def test_prepare_inputs_propagates_padded_request_count():
 @patch("vllm_ascend.worker.v2.model_states.mamba_hybrid.build_attn_metadata")
 @pytest.mark.parametrize("num_spec", [0, 3])
 @pytest.mark.parametrize("graph_mode", [CUDAGraphMode.FULL, CUDAGraphMode.NONE])
-def test_prepare_attn_keeps_actual_counts_separate_from_padding(mock_build_attn_metadata, num_spec, graph_mode):
+@pytest.mark.parametrize("uniform_token_count", [None, 1, 4])
+def test_prepare_attn_keeps_actual_counts_separate_from_padding(
+    mock_build_attn_metadata, num_spec, graph_mode, uniform_token_count
+):
     expected_metadata = {"gdn": object()}
     mock_build_attn_metadata.return_value = expected_metadata
     state = SimpleNamespace(
@@ -338,6 +341,7 @@ def test_prepare_attn_keeps_actual_counts_separate_from_padding(mock_build_attn_
         num_tokens_after_padding=4 * (num_spec + 1),
         is_prefilling_np=np.array([False, False]),
         prefill_runs_as_decode_np=None,
+        uniform_token_count=uniform_token_count,
         idx_mapping=torch.tensor([0, 1]),
         num_draft_tokens_per_req=np.full(2, num_spec, dtype=np.int32),
         num_scheduled_tokens=np.full(2, num_spec + 1, dtype=np.int32),
@@ -368,6 +372,10 @@ def test_prepare_attn_keeps_actual_counts_separate_from_padding(mock_build_attn_
     assert kwargs["num_reqs"] == graph_requests
     assert kwargs["num_tokens"] == graph_requests * (num_spec + 1)
     model_metadata = kwargs["model_specific_attn_metadata"]
+    expected_width = None
+    if graph_mode == CUDAGraphMode.FULL and uniform_token_count in (1, num_spec + 1):
+        expected_width = uniform_token_count
+    assert model_metadata.uniform_decode_query_len == expected_width
     if num_spec:
         assert model_metadata.num_decode_draft_tokens_cpu.tolist() == [num_spec] * graph_requests
         assert model_metadata.num_accepted_tokens.tolist() == [2, 3] + [1] * (graph_requests - 2)
@@ -393,6 +401,7 @@ def test_prepare_attn_classifies_one_token_prompt_tails(mock_build_attn_metadata
         num_tokens_after_padding=6 + 2 * num_draft_tokens,
         is_prefilling_np=np.array([True, True, False]),
         prefill_runs_as_decode_np=np.array([True, False, False]),
+        uniform_token_count=None,
         idx_mapping=torch.arange(3),
         num_draft_tokens_per_req=np.array([num_draft_tokens, 0, num_draft_tokens]),
         num_scheduled_tokens=np.array([num_draft_tokens + 1, 4, num_draft_tokens + 1]),
@@ -416,10 +425,54 @@ def test_prepare_attn_classifies_one_token_prompt_tails(mock_build_attn_metadata
         kv_cache_config=MagicMock(),
     )
     metadata = mock_build_attn_metadata.call_args.kwargs["model_specific_attn_metadata"]
+    assert metadata.uniform_decode_query_len is None
     assert metadata.is_prefilling.tolist() == [False, True, False]
     expected_drafts = num_draft_tokens if num_draft_tokens else -1
     assert metadata.num_decode_draft_tokens_cpu.tolist() == [expected_drafts, -1, expected_drafts]
     np.testing.assert_array_equal(input_batch.is_prefilling_np, [True, True, False])
+
+
+@patch("vllm_ascend.worker.v2.model_states.mamba_hybrid.build_attn_metadata")
+@pytest.mark.parametrize("for_capture", [False, True])
+@pytest.mark.parametrize("prompt_tail", [False, True])
+@pytest.mark.parametrize("drafts", [[3, 3], [3, 0], [2, 2]])
+def test_uniform_width_still_requires_spec_rows(mock_build_attn_metadata, for_capture, prompt_tail, drafts):
+    state = SimpleNamespace(
+        vllm_config=SimpleNamespace(num_speculative_tokens=3, parallel_config=SimpleNamespace()),
+        num_accepted_tokens_gpu=torch.tensor([1, 2], dtype=torch.int32),
+        max_model_len=1024,
+    )
+    batch = SimpleNamespace(
+        num_reqs=2,
+        num_reqs_after_padding=2,
+        num_tokens=8,
+        num_tokens_after_padding=8,
+        uniform_token_count=4,
+        is_prefilling_np=np.full(2, prompt_tail),
+        prefill_runs_as_decode_np=np.full(2, prompt_tail),
+        idx_mapping=torch.arange(2),
+        num_draft_tokens_per_req=np.array(drafts),
+        num_scheduled_tokens=np.array([4, 4]),
+        query_start_loc=torch.tensor([0, 4, 8]),
+        query_start_loc_np=np.array([0, 4, 8]),
+        seq_lens=None,
+        dcp_local_seq_lens=None,
+        seq_lens_np=np.array([128, 128]),
+        positions=None,
+        attn_state=None,
+    )
+    AscendMambaHybridModelState.prepare_attn(
+        state,
+        input_batch=batch,
+        cudagraph_mode=CUDAGraphMode.FULL,
+        block_tables=(),
+        slot_mappings=torch.empty(0, dtype=torch.int64),
+        attn_groups=[],
+        kv_cache_config=MagicMock(),
+        for_capture=for_capture,
+    )
+    metadata = mock_build_attn_metadata.call_args.kwargs["model_specific_attn_metadata"]
+    assert metadata.uniform_decode_query_len == (4 if not for_capture and drafts == [3, 3] else None)
 
 
 def test_prepare_attn_propagates_actual_request_count_to_metadata_builder():
@@ -433,12 +486,57 @@ def test_prepare_attn_propagates_actual_request_count_to_metadata_builder():
     build_call = next(
         node
         for node in ast.walk(prepare_attn)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "build_attn_metadata"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "build_metadata"
     )
     keywords = {keyword.arg: keyword.value for keyword in build_call.keywords}
 
     assert ast.unparse(keywords["num_reqs"]) == "num_reqs"
     assert ast.unparse(keywords["num_actual_reqs"]) == "input_batch.num_reqs"
+
+
+@patch("vllm_ascend.worker.v2.model_states.mamba_hybrid.build_attn_metadata")
+@pytest.mark.parametrize("num_spec", [0, 3])
+@pytest.mark.parametrize("for_capture", [False, True])
+@pytest.mark.parametrize("width", [None, 1])
+def test_ordinary_decode_uses_actual_uniform_width(mock_build_attn_metadata, num_spec, for_capture, width):
+    state = SimpleNamespace(
+        vllm_config=SimpleNamespace(num_speculative_tokens=num_spec, parallel_config=SimpleNamespace()),
+        num_accepted_tokens_gpu=torch.tensor([1, 2], dtype=torch.int32),
+        max_model_len=1024,
+    )
+    batch = SimpleNamespace(
+        num_reqs=2,
+        num_reqs_after_padding=4,
+        num_tokens=2,
+        num_tokens_after_padding=4,
+        uniform_token_count=width,
+        is_prefilling_np=np.array([False, False]),
+        prefill_runs_as_decode_np=None,
+        idx_mapping=torch.arange(2),
+        num_draft_tokens_per_req=np.zeros(2, dtype=np.int32),
+        num_scheduled_tokens=np.ones(2, dtype=np.int32),
+        query_start_loc=torch.arange(5, dtype=torch.int32),
+        query_start_loc_np=np.arange(5, dtype=np.int32),
+        seq_lens=None,
+        dcp_local_seq_lens=None,
+        seq_lens_np=np.array([128, 128, 0, 0]),
+        positions=None,
+        attn_state=None,
+    )
+    AscendMambaHybridModelState.prepare_attn(
+        state,
+        input_batch=batch,
+        cudagraph_mode=CUDAGraphMode.FULL,
+        block_tables=(),
+        slot_mappings=torch.empty(0, dtype=torch.int64),
+        attn_groups=[],
+        kv_cache_config=MagicMock(),
+        for_capture=for_capture,
+    )
+    metadata = mock_build_attn_metadata.call_args.kwargs["model_specific_attn_metadata"]
+    assert metadata.uniform_decode_query_len == (width if not for_capture else None)
+    if num_spec and not for_capture:
+        assert metadata.num_decode_draft_tokens_cpu.tolist() == [-1] * 4
 
 
 @patch(

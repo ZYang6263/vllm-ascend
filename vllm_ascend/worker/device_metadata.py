@@ -36,6 +36,42 @@ class DeviceMetadataTask:
     group_id: int
 
 
+@dataclass
+class UniformDecodeInputs:
+    # batch[0] is the live request count; batch[1:] maps rows to request state.
+    batch: torch.Tensor
+    accepted_state: torch.Tensor
+    query_len: int
+
+
+class DeferredMetadataBuilder:
+    """Opt-in producer collection for target-owned FULL decode graphs."""
+
+    def init_device_metadata(self) -> None:
+        self.graph_decode_inputs: UniformDecodeInputs | None = None
+        self._metadata_in_graph = False
+        self._metadata_tasks: tuple[DeviceMetadataTask, ...] = ()
+
+    @contextmanager
+    def defer_device_metadata(self, *, in_graph: bool = False):
+        previous = self._metadata_in_graph
+        self._metadata_in_graph = in_graph and self.graph_decode_inputs is not None
+        try:
+            yield
+        finally:
+            self._metadata_in_graph = previous
+
+    def take_device_metadata_tasks(self) -> tuple[DeviceMetadataTask, ...]:
+        tasks, self._metadata_tasks = self._metadata_tasks, ()
+        return tasks
+
+    def run_device_metadata(self, stage: DeviceMetadataStage, output: torch.Tensor, run: Callable[[], None]) -> None:
+        if self._metadata_in_graph:
+            self._metadata_tasks = (*self._metadata_tasks, DeviceMetadataTask(stage, run, id(output)))
+        else:
+            run()
+
+
 @runtime_checkable
 class DeviceMetadataTaskProvider(Protocol):
     def enable_device_metadata(self) -> None: ...
@@ -180,8 +216,9 @@ class TargetDeviceMetadata:
     Every producer is joined before the next async step may reuse its inputs.
     """
 
-    def __init__(self):
+    def __init__(self, *, wait_before_forward: bool = False):
         self.executor = DeviceMetadataExecutor(capture_producers=True)
+        self.wait_before_forward = wait_before_forward
         self._tasks: tuple[DeviceMetadataTask, ...] = ()
         self._failed = False
 
@@ -227,6 +264,9 @@ class TargetDeviceMetadata:
             return
         try:
             self.executor.submit(self._tasks)
+            if self.wait_before_forward:
+                for task in self._tasks:
+                    self.executor.wait(task.stage, task.group_id)
         except BaseException:
             self._failed = True
             if self.executor.submission_in_flight:

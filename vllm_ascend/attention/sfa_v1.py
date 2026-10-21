@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import torch
@@ -71,6 +72,7 @@ from vllm_ascend.utils import (
     is_rl_weight_update_enabled,
     maybe_trans_nz,
 )
+from vllm_ascend.worker.device_metadata import DeferredMetadataBuilder, DeviceMetadataStage
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -292,7 +294,7 @@ class SparseMLAMetadataState:
                 device=device,
             )
 
-    def prepare(self, metadata):
+    def prepare(self, metadata, *, defer=None):
         expanded = metadata.block_table
         if expanded.shape[1] % self.split:
             raise ValueError("Sparse MLA received a partially expanded SFA block table.")
@@ -301,9 +303,15 @@ class SparseMLAMetadataState:
             raise ValueError("Sparse MLA block table exceeds its persistent buffer.")
         table = self.block_table_buffer[: expanded.shape[0], :width]
         if self.table_stride == 1:
-            table.copy_(expanded)
+            run = partial(table.copy_, expanded)
         else:
-            torch.div(expanded[:, :: self.table_stride], self.table_stride, rounding_mode="floor", out=table)
+            run = partial(
+                torch.div, expanded[:, :: self.table_stride], self.table_stride, rounding_mode="floor", out=table
+            )
+        if defer is None:
+            run()
+        else:
+            defer(table, run)
         metadata.block_table = table
         metadata.block_size = self.block_size
         if self.use_smla:
@@ -488,7 +496,7 @@ class SFAForwardContext:
     gather_full_o_proj: bool = False
 
 
-class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
+class AscendSFAMetadataBuilder(DeferredMetadataBuilder, MLACommonMetadataBuilder[AscendSFAMetadata]):
     """
     NOTE: Please read the comment at the top of the file before trying to
     understand this class
@@ -513,6 +521,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         )
 
         # Match the logical block size selected for BlockTable.
+        self.init_device_metadata()
         self.kernel_block_size = select_common_block_size(kv_cache_spec.block_size, [AscendSFABackend])
 
         layer = vllm_config.compilation_config.static_forward_context[layer_names[0]]
@@ -728,7 +737,12 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             self.nope_states[draft_index] = SparseMLAMetadataState(
                 self.kv_cache_spec, self.vllm_config, self.device, self.kernel_block_size
             )
-        self.nope_states[draft_index].prepare(metadata)
+        if self._metadata_in_graph:
+            self.nope_states[draft_index].prepare(
+                metadata, defer=partial(self.run_device_metadata, DeviceMetadataStage.ATTENTION)
+            )
+        else:
+            self.nope_states[draft_index].prepare(metadata)
 
     def build_for_cudagraph_capture(
         self,

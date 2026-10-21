@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Three fused adapters for CANN pooled indexing: inputs, cache writes and indices."""
 
+from functools import partial
 from types import SimpleNamespace
 
 from vllm.triton_utils import tl, triton
@@ -196,7 +197,11 @@ def _build_keypool_metadata_kernel(
     cp_start,
     cp_end,
     CP_MODE: tl.constexpr,
+    batch=None,
+    GRAPH_QUERY_LEN: tl.constexpr = 0,
 ):
+    if GRAPH_QUERY_LEN:
+        actual = tl.load(batch).to(tl.int32) * GRAPH_QUERY_LEN
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     q0 = tl.load(raw_query + row * QUERY_STRIDE, row <= n, other=0)
     q0 = tl.minimum(tl.where(q0 < 0, actual, q0), actual)
@@ -292,7 +297,19 @@ def _build_keypool_metadata_kernel(
             tl.store(compact, -1)
 
 
-def build_keypool_metadata(common, buffers, tokens, source, logical, ratio, *, query_metadata=None, local_start=0):
+def build_keypool_metadata(
+    common,
+    buffers,
+    tokens,
+    source,
+    logical,
+    ratio,
+    *,
+    query_metadata=None,
+    local_start=0,
+    graph_inputs=None,
+    defer=None,
+):
     n = common.num_reqs
     pooled = min(tokens, tokens // ratio + n)
     # Fully padded buckets can have empty source tensors. Keep masked input
@@ -303,7 +320,8 @@ def build_keypool_metadata(common, buffers, tokens, source, logical, ratio, *, q
         METADATA_BLOCK,
         max(METADATA_MIN_BLOCK, triton.next_power_of_2(triton.cdiv(max(tokens, n + 1), METADATA_PROGRAMS))),
     )
-    _build_keypool_metadata_kernel[(triton.cdiv(max(tokens, n + 1), block),)](
+    run = partial(
+        _build_keypool_metadata_kernel[(triton.cdiv(max(tokens, n + 1), block),)],
         common.query_start_loc,
         common.seq_lens,
         source_positions,
@@ -349,7 +367,13 @@ def build_keypool_metadata(common, buffers, tokens, source, logical, ratio, *, q
         local_start,
         local_start + query_metadata.positions.numel() if query_metadata is not None else 0,
         query_metadata is not None,
+        batch=graph_inputs.batch if graph_inputs is not None else None,
+        GRAPH_QUERY_LEN=graph_inputs.query_len if graph_inputs is not None else 0,
     )
+    if defer is None:
+        run()
+    else:
+        defer(buffers.positions, run)
     return (
         buffers.positions[:tokens],
         buffers.slot_mapping[:tokens],
@@ -362,14 +386,15 @@ def build_keypool_metadata(common, buffers, tokens, source, logical, ratio, *, q
     )
 
 
-def build_tail_inputs(common, pool, capacity, page_rows, retained_width, buffers):
+def build_tail_inputs(common, pool, capacity, page_rows, retained_width, buffers, *, graph_inputs=None, defer=None):
     n = common.num_reqs
     width = retained_width or pool
     history = buffers["history"][:n]
     writes = buffers["writes"].view(-1)[: n * width].view(n, width)
     state = buffers["state"].view(-1)[: n * width].view(n, width)
     retained = buffers["retained"].view(-1)[: n * width].view(n, width) if retained_width else None
-    _build_keypool_metadata_kernel[(triton.cdiv(n + 1, METADATA_MIN_BLOCK),)](
+    run = partial(
+        _build_keypool_metadata_kernel[(triton.cdiv(n + 1, METADATA_MIN_BLOCK),)],
         common.query_start_loc,
         common.seq_lens,
         common.positions,
@@ -415,7 +440,13 @@ def build_tail_inputs(common, pool, capacity, page_rows, retained_width, buffers
         0,
         0,
         False,
+        batch=graph_inputs.batch if graph_inputs is not None else None,
+        GRAPH_QUERY_LEN=graph_inputs.query_len if graph_inputs is not None else 0,
     )
+    if defer is None:
+        run()
+    else:
+        defer(buffers["history"], run)
     return SimpleNamespace(
         history_indices=history,
         write_indices=writes,

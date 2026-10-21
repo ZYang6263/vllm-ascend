@@ -119,6 +119,7 @@ from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.kv_connector import MambaCopyKVConnector
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
+from vllm_ascend.worker.v2.model_states.gdn_graph import GDNGraphMetadata, create_gdn_graph_metadata
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.pp_transport import resolve_spec_pp_support
 from vllm_ascend.worker.v2.spec_decode import init_speculator
@@ -254,6 +255,7 @@ class NPUModelRunner(GPUModelRunner):
         # NOTE: In GPUModelRunner, decode_query_len is initialized in load_model(),
         # +1 is hardcoded here but not in vllm.
         self.decode_query_len = self.num_speculative_steps + 1
+        self._uniform_decode_token_count: int | None = None
         # Set _mc2_tokens_capacity and _reserved_mc2_mask for MoE communication optimization.
         # TODO: remove set_cos_and_sin (together with update_cos_sin) when mla can properly handle cos/sin internally
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.decode_query_len, self.dtype, self.device)
@@ -484,7 +486,7 @@ class NPUModelRunner(GPUModelRunner):
         self.model_state.device_metadata = (
             TargetDeviceMetadata()
             if uses_a5_packed_cache() and self.model_config.architecture == "DeepseekV41ForCausalLM"
-            else None
+            else create_gdn_graph_metadata(self.vllm_config, self.model_state, self.attn_groups)
         )
 
         # Upstream has bound every local cache; publish sealed plans before
@@ -812,6 +814,15 @@ class NPUModelRunner(GPUModelRunner):
                     int(batch_state.num_scheduled_tokens.max()),
                     batch_state.decode_graph_eligible,
                 )
+        metadata = getattr(self.model_state, "device_metadata", None)
+        if isinstance(metadata, GDNGraphMetadata) and batch_state is not None and not dummy_run:
+            if not metadata.eligible(batch_state, scheduler_output.scheduled_spec_decode_tokens, uniform_token_count):
+                batch_state = batch_state._replace(decode_graph_eligible=False)
+                uniform_token_count = None
+        # gather_batch_req_state and prepare_inputs run sequentially per step.
+        # Preserve the actual batch classification: a varlen graph descriptor
+        # need not retain it. Dummy/capture batches keep their own default None.
+        self._uniform_decode_token_count = uniform_token_count if batch_state is not None else None
         return batch_state, uniform_token_count
 
     def _check_finegrained_tp_graph_step(self, cg_mode: CUDAGraphMode) -> None:
@@ -1073,6 +1084,8 @@ class NPUModelRunner(GPUModelRunner):
             # extra attributes for ascend npus.
             seq_lens_np=self.input_buffers.seq_lens_np,
             attn_state=attn_state,
+            # Compaction can invalidate the scheduler's uniform query lengths.
+            uniform_token_count=self._uniform_decode_token_count if not adaptive_verification_active else None,
         )
         # vLLM main (#57980) dropped the module-level maybe_partition_pcp_batch
         # helper; PCPManager.partition_batch now takes the batch descriptor.

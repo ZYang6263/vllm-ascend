@@ -17,6 +17,53 @@ def mock_triton_launch_config(monkeypatch):
     monkeypatch.setattr(adapters, "triton", triton)
 
 
+@pytest.mark.parametrize("tail_mode", [False, True])
+def test_metadata_can_be_queued_with_a_live_device_count(monkeypatch, tail_mode):
+    launch = MagicMock()
+    monkeypatch.setattr(adapters, "_build_keypool_metadata_kernel", launch)
+    common = SimpleNamespace(
+        num_reqs=2,
+        num_actual_tokens=8,
+        query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
+        seq_lens=torch.tensor([16, 32]),
+        positions=torch.arange(8),
+        slot_mapping=torch.arange(8),
+        block_table_tensor=torch.ones(2, 1, dtype=torch.int32),
+    )
+    inputs = SimpleNamespace(batch=torch.tensor([2, 1, 0]), query_len=4)
+    tasks = []
+    defer = lambda output, run: tasks.append(run)
+    if tail_mode:
+        buffers = {name: torch.empty(2, 4, dtype=torch.int64) for name in ("history", "writes", "state", "retained")}
+        adapters.build_tail_inputs(common, 4, 8, 80, 4, buffers, graph_inputs=inputs, defer=defer)
+    else:
+        buffers = SimpleNamespace(
+            **{
+                name: torch.empty(16, dtype=torch.int64)
+                for name in (
+                    "positions",
+                    "slot_mapping",
+                    "seq_lens",
+                    "raw_seq_lens",
+                    "query_start_loc",
+                    "cum_query_lens",
+                    "start_pos",
+                    "pool_tail",
+                    "start_offsets",
+                    "pooled_slot_mapping",
+                )
+            }
+        )
+        adapters.build_keypool_metadata(common, buffers, 8, 8, 128, 4, graph_inputs=inputs, defer=defer)
+    launch.__getitem__.return_value.assert_not_called()
+    assert len(tasks) == 1
+    inputs.batch[0] = 1
+    tasks[0]()
+    kwargs = launch.__getitem__.return_value.call_args.kwargs
+    assert kwargs["batch"] is inputs.batch
+    assert kwargs["GRAPH_QUERY_LEN"] == 4
+
+
 @pytest.mark.parametrize("retained_width,cp_start", [(0, None), (3, 2)])
 def test_metadata_launches_use_preallocated_request_and_tail_buffers(monkeypatch, retained_width, cp_start):
     launch = MagicMock()

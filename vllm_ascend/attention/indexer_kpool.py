@@ -30,6 +30,7 @@ from vllm_ascend.core.kv_cache_interface import (
 )
 from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_current_hardware_profile
 from vllm_ascend.utils import _round_up, enable_dsa_cp
+from vllm_ascend.worker.device_metadata import DeferredMetadataBuilder, DeviceMetadataStage
 
 GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE = 128
 
@@ -84,7 +85,7 @@ class _KPoolMetadataBuffers:
     pooled_slot_mapping: torch.Tensor
 
 
-class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
+class AscendIndexerKPoolMetadataBuilder(DeferredMetadataBuilder, AttentionMetadataBuilder):
     """Build pool-level addressing for the compressed indexer cache."""
 
     @classmethod
@@ -115,6 +116,7 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         if not layer_names or any(not name.endswith(".indexer.k_cache") for name in layer_names):
             raise ValueError(f"Invalid Indexer KPool cache layer names: {layer_names}.")
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.init_device_metadata()
         self.logical_block_size = vllm_config.cache_config.block_size
         self.storage_block_size = get_storage_block_size(kv_cache_spec)
         if self.storage_block_size <= 0:
@@ -257,6 +259,8 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
             self.compress_ratio,
             query_metadata=query_metadata,
             local_start=self.dsa_cp_rank * (num_cache_tokens // self.dsa_cp_size),
+            graph_inputs=self.graph_decode_inputs if self._metadata_in_graph else None,
+            defer=partial(self.run_device_metadata, DeviceMetadataStage.INDEXER) if self._metadata_in_graph else None,
         )
         block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         return AscendIndexerKPoolMetadata(
@@ -346,7 +350,7 @@ class AscendIndexerKPoolTailMetadata:
     cann_inputs: Any = None
 
 
-class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
+class AscendIndexerKPoolTailMetadataBuilder(DeferredMetadataBuilder, AttentionMetadataBuilder):
     """Build independent metadata for the GLM-Next compressor tail."""
 
     @classmethod
@@ -373,6 +377,7 @@ class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
                 f"AscendIndexerKPoolTailSpec, got {type(kv_cache_spec).__name__}."
             )
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.init_device_metadata()
         self.block_size = kv_cache_spec.block_size
         # Persistent rings are separate from temporary CANN state pages.
         self._max_num_metadata_reqs = max(
@@ -419,6 +424,8 @@ class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
             self._page_rows,
             max(1, retained_width) if self._lookahead else 0,
             self._tail_inputs[key],
+            graph_inputs=self.graph_decode_inputs if self._metadata_in_graph else None,
+            defer=partial(self.run_device_metadata, DeviceMetadataStage.INDEXER) if self._metadata_in_graph else None,
         )
         return AscendIndexerKPoolTailMetadata(
             block_table=block_table,

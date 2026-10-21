@@ -10,6 +10,30 @@
     3. `_pack_indices_kernel` preserves the selected history, appends the causal tail and clears padded rows/alignment columns in one launch. It can write directly into the SFA output buffer.
 - **Supported modes**: Eager execution and fixed-shape NPU graph capture/replay.
 
+## Target FULL metadata capture
+
+For MRV2 `Glm5NextForCausalLM` with C8, `align` state caching and uniform
+full-width speculative decode, the target can capture the GDN, KeyPool and
+SFA metadata producers before model execution. This path requires a separate
+FULL decode graph, fixed speculative width, and PCP/DCP/PP/DP sizes of one;
+KV transfer, adaptive verification and DSA-CP use the existing preparation.
+
+`UniformDecodeInputs.batch` is persistent int64 storage: element zero holds
+the live request count and the remaining elements map batch rows to request
+state. GDN reads accepted counts through this mapping, replacing the temporary
+fill/index/copy chain. Both KeyPool metadata entry points accept optional
+`graph_inputs` and `defer` arguments. When present, they queue their launch
+and read the live token count as `batch[0] * query_len` inside the kernel.
+Padded request/token capacities and source-buffer extents remain static.
+
+The target uploads the batch descriptor before replay and retains pinned
+sources until their asynchronous copies complete. Producer-stream readiness,
+the main-stream wait before model execution, and the final join are captured
+in the same FULL graph. Runtime preparation does not launch these producers.
+All captured output positions, including GDN padding indices, are overwritten.
+Incompatible batches are excluded before graph dispatch; capture-time input
+addresses and strides are checked before replay.
+
 ## Parameters
 
 `R` is the padded request count, `T` the padded token count, `A` the actual token count, `D` the head dimension, `C` the tail ring capacity, `B` the compressed kernel block size and `W = retained_width or P`. Model values are `D=128`, `P=4` and `topk=2048`. All tensors are on the same NPU; scalar attributes are Python integers.
