@@ -1507,3 +1507,46 @@ def test_host_conv_indices_are_shared_and_refreshed(monkeypatch):
     refreshed = builder.build(0, common).non_spec_prefill_metadata.causal_conv1d.cache_indices
     assert refreshed.data_ptr() == indices.data_ptr()
     assert indices.tolist() == [40, 50]
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["uniform", "capture", "prefill", "mixed_width", "mixed_drafts", "missing_accepted", "cache_mode", "capacity"],
+)
+def test_host_fused_decode_dispatch(case):
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        builder_cls=AscendGDNHostMetadataBuilder,
+        mamba_cache_mode="align",
+        num_speculative_blocks=3,
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+    )
+    builder.compilation_config.static_forward_context = {"layer0": SimpleNamespace(use_contiguous_conv_indices=True)}
+    common = create_common_attn_metadata(BatchSpec([32, 32], [4, 4]), 16, torch.device("cpu"))
+    common.is_prefilling.zero_()
+    accepted, drafts, actual = torch.ones(2, dtype=torch.int32), torch.tensor([3, 3]), 2
+    if case == "capture":
+        actual = None
+    elif case == "prefill":
+        common.is_prefilling[0] = True
+    elif case == "mixed_width":
+        common.query_start_loc_cpu[1] = 3
+    elif case == "mixed_drafts":
+        drafts[0] = 0
+    elif case == "missing_accepted":
+        accepted = None
+    elif case == "cache_mode":
+        builder.vllm_config.cache_config.mamba_cache_mode = "all"
+    elif case == "capacity":
+        builder.decode_cudagraph_max_bs = 1
+    fallback = SimpleNamespace(spec_decode_metadata=None, non_spec_prefill_metadata=None, non_spec_decode_metadata=None)
+    with (
+        patch.object(builder, "_build_uniform_decode", return_value=object()) as fused,
+        patch.object(AscendGDNAttentionMetadataBuilder, "build", return_value=fallback) as generic,
+    ):
+        result = builder.build(0, common, accepted, drafts, num_actual_reqs=actual)
+    assert fused.call_count == int(case == "uniform")
+    assert generic.call_count == int(case != "uniform")
+    assert result is (fused.return_value if case == "uniform" else fallback)

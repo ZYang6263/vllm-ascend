@@ -38,6 +38,7 @@ from vllm_ascend.ops.triton.fla.utils import (
     prepare_final_chunk_indices,
     prepare_update_chunk_offsets,
 )
+from vllm_ascend.ops.triton.v2.mamba.gdn_metadata import prepare_gdn_decode_metadata
 
 _GDN_CHUNK_SIZE = 64
 # Keep this aligned with solve_tril.LARGE_BLOCK_T in ops/triton/fla/solve_tril.py.
@@ -1067,6 +1068,138 @@ class AscendGDNHostMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         if self._spec_conv_indices is not None:
             self._spec_conv_indices[:graph_batch_size].fill_(PAD_SLOT_ID)
 
+    def _uniform_decode_query_len(
+        self,
+        m: CommonAttentionMetadata,
+        num_accepted_tokens: torch.Tensor | None,
+        num_decode_draft_tokens_cpu: torch.Tensor | None,
+        num_actual_reqs: int | None,
+    ) -> int | None:
+        # An explicit live count excludes capture and distinguishes padded rows.
+        # Classify using existing CPU metadata; do not synchronize device tensors.
+        if (
+            num_actual_reqs is None
+            or not 0 < num_actual_reqs <= m.num_reqs <= self.decode_cudagraph_max_bs
+            or (not self.use_full_cuda_graph and num_actual_reqs != m.num_reqs)
+            or self._spec_conv_indices is None
+            or self.vllm_config.cache_config.mamba_cache_mode != "align"
+            or m.is_prefilling is None
+            or m.is_prefilling[:num_actual_reqs].numpy().any()
+        ):
+            return None
+        starts = m.query_start_loc_cpu[: num_actual_reqs + 1].numpy()
+        query_len = int(starts[1] - starts[0])
+        if (
+            query_len not in (1, self.num_spec + 1)
+            or starts[0] != 0
+            or not ((starts[1:] - starts[:-1]) == query_len).all()
+            or m.num_actual_tokens != num_actual_reqs * query_len
+        ):
+            return None
+        if query_len > 1:
+            if (
+                num_accepted_tokens is None
+                or num_decode_draft_tokens_cpu is None
+                or self.kv_cache_spec.num_speculative_blocks != self.num_spec
+                or (self.use_full_cuda_graph and not self._can_pad_spec_decode(m.num_reqs, m.num_actual_tokens))
+                or not (num_decode_draft_tokens_cpu[:num_actual_reqs].numpy() == query_len - 1).all()
+            ):
+                return None
+        elif num_decode_draft_tokens_cpu is not None and (num_decode_draft_tokens_cpu.numpy() > 0).any():
+            return None
+        return query_len
+
+    def _build_uniform_decode(
+        self,
+        m: CommonAttentionMetadata,
+        num_accepted_tokens: torch.Tensor | None,
+        num_actual_reqs: int,
+        query_len: int,
+    ) -> GDNAttentionMetadata:
+        # Reuse the generic path's buffers so existing model graphs consume the
+        # new contents without capturing the metadata preparation itself.
+        is_spec = query_len > 1
+        num_tokens = num_actual_reqs * query_len
+        if is_spec:
+            states = self.spec_state_indices_tensor
+            query = self.spec_query_start_loc
+            lengths = self.spec_actual_seq_lengths
+        else:
+            if self.use_full_cuda_graph and self.use_spec_decode:
+                self._reset_spec_decode_graph_inputs(m.num_reqs)
+            states = self.non_spec_state_indices_tensor
+            query = self.non_spec_query_start_loc
+            lengths = self.non_spec_actual_seq_lengths
+        conv_output_numel = self._conv_output_buffer.numel() if self._conv_output_buffer is not None else 0
+        clear_block = 1024
+        grid = (m.num_reqs + (conv_output_numel + clear_block - 1) // clear_block,)
+        prepare_gdn_decode_metadata[grid](
+            m.block_table_tensor,
+            m.seq_lens,
+            num_accepted_tokens,
+            states,
+            self._spec_conv_indices,
+            self.spec_sequence_masks,
+            query,
+            lengths,
+            self.num_accepted_tokens,
+            self.spec_token_indx,
+            self._conv_output_buffer,
+            NUM_ACTUAL_REQS=num_actual_reqs,
+            NUM_REQS=m.num_reqs,
+            QUERY_LEN=query_len,
+            BLOCK_SIZE=self.kv_cache_spec.block_size,
+            TABLE_ROW_STRIDE=m.block_table_tensor.stride(0),
+            TABLE_COL_STRIDE=m.block_table_tensor.stride(1),
+            SEQ_LEN_STRIDE=m.seq_lens.stride(0),
+            ACCEPTED_STRIDE=num_accepted_tokens.stride(0) if is_spec else 1,
+            PAD_BLOCK_ID=self._SPEC_GRAPH_PAD_SLOT_ID if is_spec else NULL_BLOCK_ID,
+            BLOCK=1 << (query_len - 1).bit_length(),
+            CONV_OUTPUT_NUMEL=conv_output_numel,
+            CLEAR_BLOCK=clear_block,
+        )
+        metadata = GDNAttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decodes=0 if is_spec else num_actual_reqs,
+            num_decode_tokens=0 if is_spec else num_tokens,
+            num_spec_decodes=num_actual_reqs if is_spec else 0,
+            num_spec_decode_tokens=num_tokens if is_spec else 0,
+            num_actual_tokens=m.num_actual_tokens,
+            spec_state_indices_tensor=states[: m.num_reqs] if is_spec else None,
+            spec_sequence_masks=self.spec_sequence_masks[: m.num_reqs] if is_spec else None,
+            spec_query_start_loc=query[: m.num_reqs + 1] if is_spec else None,
+            num_accepted_tokens=self.num_accepted_tokens[: m.num_reqs] if is_spec else None,
+            spec_token_indx=self.spec_token_indx[:num_tokens] if is_spec else None,
+            non_spec_token_indx=self.non_spec_token_indx[:0] if is_spec else None,
+            non_spec_state_indices_tensor=states[: m.num_reqs] if not is_spec else None,
+            non_spec_query_start_loc=query[: m.num_reqs + 1] if not is_spec else None,
+        )
+        metadata.non_spec_prefill_metadata = None
+        metadata.non_spec_decode_metadata = None
+        metadata.spec_decode_metadata = None
+        if is_spec:
+            metadata.spec_decode_metadata = GDNSpecDecodeMetadata(
+                spec_causal_conv1d=GDNSpecCausalConv1dMetadata(
+                    query_start_loc=metadata.spec_query_start_loc,
+                    cache_indices=self._spec_conv_indices[: m.num_reqs],
+                    num_accepted_tokens=metadata.num_accepted_tokens,
+                    output_buffer=self._conv_output_buffer,
+                ),
+                actual_seq_lengths=lengths[: m.num_reqs + 1],
+            )
+        else:
+            metadata.non_spec_decode_metadata = GDNDecodeMetadata(
+                causal_conv1d=GDNCausalConv1dMetadata(
+                    query_start_loc=metadata.non_spec_query_start_loc,
+                    cache_indices=metadata.non_spec_state_indices_tensor,
+                    initial_state_mode=None,
+                    output_buffer=self._conv_output_buffer,
+                ),
+                actual_seq_lengths=lengths[: m.num_reqs + 1],
+            )
+        return metadata
+
     def build(
         self,
         common_prefix_len: int,
@@ -1078,6 +1211,11 @@ class AscendGDNHostMetadataBuilder(AscendGDNAttentionMetadataBuilder):
     ) -> GDNAttentionMetadata:
         self._ensure_conv_index_buffers()
         self._ensure_conv_output_buffer()
+        query_len = self._uniform_decode_query_len(
+            common_attn_metadata, num_accepted_tokens, num_decode_draft_tokens_cpu, num_actual_reqs
+        )
+        if query_len is not None:
+            return self._build_uniform_decode(common_attn_metadata, num_accepted_tokens, num_actual_reqs, query_len)
         metadata = super().build(
             common_prefix_len,
             common_attn_metadata,
