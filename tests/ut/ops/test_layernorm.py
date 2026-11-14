@@ -254,6 +254,28 @@ def test_norm_bias_lookup_reports_missing_bias(clean_norm_bias_cache):
     assert ascend_layernorm._quant_description_has_norm_bias(quant_description) is False
 
 
+@pytest.mark.parametrize(
+    "bias_names, expected",
+    [
+        (["model.layers.0.self_attn.indexer.k_norm.bias"], False),
+        (["model.layers.7.self_attn.indexer.k_norm.bias"], False),
+        (["model.layers.0.input_layernorm.bias"], True),
+        (["model.layers.7.enorm.bias"], True),
+        (["model.layers.7.hnorm.bias"], True),
+        (["model.layers.7.shared_head.norm.bias"], True),
+        (
+            ["model.layers.7.self_attn.indexer.k_norm.bias", "model.layers.7.enorm.bias"],
+            True,
+        ),
+    ],
+    ids=["indexer", "mtp-indexer", "rmsnorm", "mtp-enorm", "mtp-hnorm", "mtp-head", "mixed"],
+)
+def test_norm_bias_lookup_distinguishes_indexer_layernorm(bias_names, expected, clean_norm_bias_cache):
+    quant_description = dict.fromkeys(bias_names, "FLOAT")
+
+    assert ascend_layernorm._quant_description_has_norm_bias(quant_description) is expected
+
+
 def test_norm_bias_lookup_ignores_a_stale_entry(clean_norm_bias_cache):
     """An id can only be reused after the old dict is gone; never trust it blindly."""
     quant_description = {"model.layers.0.input_layernorm.norm.bias": "FLOAT"}

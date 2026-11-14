@@ -39,7 +39,9 @@ def _quant_description_has_norm_bias(quant_description: dict) -> bool:
     cached = _NORM_BIAS_IN_QUANT_DESCRIPTION.get(cache_key)
     if cached is not None and cached[0] is quant_description:
         return cached[1]
-    has_norm_bias = any("norm.bias" in name for name in quant_description)
+    # The sparse indexer uses ordinary LayerNorm; its bias is not an
+    # anti-quantization bias for RMSNorm modules.
+    has_norm_bias = any("norm.bias" in name and not name.endswith(".indexer.k_norm.bias") for name in quant_description)
     _NORM_BIAS_IN_QUANT_DESCRIPTION[cache_key] = (quant_description, has_norm_bias)
     return has_norm_bias
 
