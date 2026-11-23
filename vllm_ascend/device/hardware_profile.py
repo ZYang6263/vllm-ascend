@@ -271,6 +271,10 @@ class HardwareProfile:
     # query length to work around native operator numerical failures. None
     # retains native dispatch; this is a stack workaround, not a silicon limit.
     gdn_fixed_spec_recurrent_fallback_min_query_len: int | None = None
+    # MRv2's upstream scalar post-update kernel drops request rows on Ascend960.
+    requires_tiled_post_update: bool = False
+    # The resampling finalizer must read immutable zero-based rejection indices.
+    requires_disjoint_resample_indices: bool = False
 
     def supports(self, capability: HardwareCapability) -> bool:
         """Return whether the exact documented ``capability`` contract is available."""
@@ -529,6 +533,8 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
         # capability set minus the ATB contracts A6 does not support.
         AscendDeviceType.A6: HardwareProfile(
             _device_type=AscendDeviceType.A6,
+            requires_tiled_post_update=True,
+            requires_disjoint_resample_indices=True,
             attention_backend_family=AttentionBackendFamily.STANDARD,
             cpu_binding_mode=CPUBindingMode.TOPO_AFFINITY,
             default_worker_cls=_DEFAULT_WORKER_CLS,

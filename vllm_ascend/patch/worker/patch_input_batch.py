@@ -19,9 +19,18 @@
 
 
 # 显式导入模块，确保模块被加载后再进行 patch
-from vllm.v1.worker.gpu import cudagraph_utils, model_runner
+from vllm.triton_utils import HAS_TRITON
+from vllm.v1.worker.gpu import cudagraph_utils, input_batch, model_runner
 
+from vllm_ascend.device.hardware_profile import get_current_hardware_profile
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 
 cudagraph_utils.InputBatch = AscendInputBatch
 model_runner.InputBatch = AscendInputBatch
+
+if HAS_TRITON and get_current_hardware_profile().requires_tiled_post_update:
+    from vllm_ascend.ops.triton.sample.post_update import post_update
+
+    input_batch.post_update = post_update
+    # GPUModelRunner imports the function by name.
+    model_runner.post_update = post_update

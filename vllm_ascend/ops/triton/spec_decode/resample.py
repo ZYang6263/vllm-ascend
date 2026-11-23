@@ -7,6 +7,7 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import tl, triton
 
+from vllm_ascend.device.hardware_profile import get_current_hardware_profile
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
 
 _RESAMPLE_BLOCK_SIZE = 1024
@@ -446,6 +447,12 @@ def resample(
         has_auto_blockify_blacklist_op=True,
     )
 
+    # The public API converts zero-based rejection positions to counts in place.
+    # On A6 the finalizer can reread an updated count as its rejection position.
+    # Preserve the positions until all rows have finished reading them.
+    rejected_steps = (
+        num_sampled.clone() if get_current_hardware_profile().requires_disjoint_resample_indices else num_sampled
+    )
     _categorical_finalize_kernel[(num_reqs,)](
         sampled,
         sampled.stride(0),
@@ -463,7 +470,7 @@ def resample(
         draft_logits.stride(0),
         draft_logits.stride(1),
         draft_rejected_logsumexp,
-        num_sampled,
+        rejected_steps,
         cu_num_logits,
         expanded_idx_mapping,
         draft_sampled,

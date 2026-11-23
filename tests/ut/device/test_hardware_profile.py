@@ -256,6 +256,13 @@ def test_current_hardware_profile_uses_device_config() -> None:
     assert get_current_hardware_profile() is expected_profile
 
 
+@pytest.mark.parametrize("device_type", list(AscendDeviceType))
+def test_mrv2_sampling_update_policies(device_type: AscendDeviceType) -> None:
+    profile = get_hardware_profile(device_type)
+    assert profile.requires_tiled_post_update is (device_type is AscendDeviceType.A6)
+    assert profile.requires_disjoint_resample_indices is (device_type is AscendDeviceType.A6)
+
+
 def test_current_hardware_profile_is_dynamo_safe(monkeypatch: pytest.MonkeyPatch) -> None:
     # CPU UTs expose a mocked NPU backend that is not importable as
     # ``torch.npu``. Keep accelerator stream discovery out of this test so it

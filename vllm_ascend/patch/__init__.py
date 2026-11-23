@@ -1702,6 +1702,10 @@
 #       replace InputBatch with AscendInputBatch.
 #    Future Plan:
 #       remove this patch when vLLM-ascend's make_dummy behavior aligns with vLLM.
+#   2. `vllm.v1.worker.gpu.input_batch.post_update`
+#       On A6, the scalar kernel can miss state writes past request 36.
+#       Register the row-tiled implementation at the MRv2 sampling call site.
+#       Remove when upstream passes the multi-request MTP state regression on A6.
 #
 # ** 27. File: worker/patch_model_state.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
