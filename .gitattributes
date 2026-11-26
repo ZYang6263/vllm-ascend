@@ -3,6 +3,9 @@
 # a round trip through a Windows checkout.
 * text=auto eol=lf
 
+# Unified diff context uses a single space for an empty source line.
+csrc/attention/sparse_flash_attention/cann-9.3-balanced-decode.patch whitespace=-blank-at-eol
+
 # Binary assets must never be normalized.
 *.so   binary
 *.o    binary

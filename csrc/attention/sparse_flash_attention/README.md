@@ -32,6 +32,57 @@ export ASCEND_CUSTOM_OPP_PATH="$vendor${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_
 pytest tests/e2e/nightly/single_node/ops/singlecard_ops/test_sparse_flash_attention.py -k tnd_output_padding
 ```
 
+### A6 泛化 decode 优化
+
+`cann-9.3-balanced-decode.patch` 保存了当前泛化优化的完整源码差异，适用基线同为
+`75b6beb460eb32644a6c87fa5f9d76b756d17b4d`。它只改变 A6 的目标模板：BF16、
+64 个 query heads、单 KV head、head dim 512、RoPE dim 64、paged128、topk2048、
+TND/PA_BSND、sparse mode 3，且不返回 LSE、不使用 sinks。
+
+- 按运行时累计长度读取实际 Q，按 tile 工作量分配 64 核，覆盖小 Q、跨核负载台阶、
+  混合请求长度及图模式 padding；只有估算收益足够时才使用切分路径。
+- 将符合条件的离散 KV 直接搬入 L1；完整 query 直接输出，跨核 query 的首片结果保留在 UB，
+  只对其余分片使用有界工作区，并以 FP32 合并结果。
+- 对非目标模板、短 KV 或不完整有效索引保留原路径。该补丁不修复原生回退路径已有的精度问题。
+
+在上面的 padding 补丁之后，继续应用泛化优化，再构建目标模板：
+
+```sh
+decode_patch="$VLLM_ASCEND_SRC/csrc/attention/sparse_flash_attention/cann-9.3-balanced-decode.patch"
+git apply --check "$decode_patch"
+git apply "$decode_patch"
+bash build.sh --pkg --ops=sparse_flash_attention --soc=ascend960dt \
+    --vendor_name=a6_sfa_balanced \
+    --kernel_template_input=FLASH_DECODE=false,PAGE_ATTENTION=true,LAYOUT_T=1,KV_LAYOUT_T=2,TEMPLATE_MODE=1,IS_SPLIT_G=false,HAS_ROPE=true
+```
+
+将新算子包解到独立目录，并使 `SFA_PACKAGE_DIR` 指向解包根目录。加载该包的 API 库和 kernel：
+
+```sh
+vendor="$SFA_PACKAGE_DIR/packages/vendors/a6_sfa_balanced_transformer"
+export ASCEND_CUSTOM_OPP_PATH="$vendor${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
+export LD_LIBRARY_PATH="$vendor/op_api/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```
+
+已有硬件记录来自此优化补丁的独立算子包：27 组主用例、6 组补充边界用例及同图 11 个动态状态
+通过有效输出的 CPU golden 采样检查。主用例覆盖 Q1–256、混合请求长度和 padding；动态状态的实际 Q
+依次为 `[36, 64, 6, 24, 48, 65, 96, 128, 4, 0, 36]`，物理容量固定为 128。
+这不是每个输出元素的穷尽精度验证。1024 个有效索引、其余索引为 -1 的已知回退场景中，
+原生与优化包均未通过 CPU golden，未计为通过。
+
+以下是已有记录中已核验输入哈希一致的原始源码版与优化版对照。两版在同一张 A6 卡 3 上分时测量，
+各预热 20 次，取 12 次 NPUGraph 设备 kernel 时长的中位数，单位为微秒。
+
+| 场景 | 原始源码版 | 优化版 | 时延降低 |
+| --- | ---: | ---: | ---: |
+| Q33，混合长度 | 138.374 | 79.529 | 42.5% |
+| Q36，KV49152 | 140.449 | 82.154 | 41.5% |
+| Q40，混合长度 | 139.009 | 88.954 | 36.0% |
+
+其他 Q 的原始版记录未完成逐项核验，不据此推算全 Q 或模型端到端收益。
+本次提交复用上述硬件记录；已静态确认 padding 与优化补丁可以依次应用，
+两者组合后的算子包尚未新增 NPU 复测。
+
 ## 功能说明
 
 - API功能：sparse_flash_attention（SFA）是针对大序列长度推理场景的高效注意力计算模块，该模块通过“只计算关键部分”大幅减少计算量，然而会引入大量的离散访存，造成数据搬运时间增加，进而影响整体性能。

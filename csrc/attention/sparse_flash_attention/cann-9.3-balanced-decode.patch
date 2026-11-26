@@ -1,0 +1,1142 @@
+diff --git a/attention/sparse_flash_attention/op_host/sparse_flash_attention_tiling.cpp b/attention/sparse_flash_attention/op_host/sparse_flash_attention_tiling.cpp
+index b777abea..2d3a2c30 100644
+--- a/attention/sparse_flash_attention/op_host/sparse_flash_attention_tiling.cpp
++++ b/attention/sparse_flash_attention/op_host/sparse_flash_attention_tiling.cpp
+@@ -23,6 +23,7 @@
+ #include "err/ops_err.h"
+ #include "register/op_def_registry.h"
+ #include "../op_kernel/sparse_flash_attention_template_tiling_key.h"
++#include "../op_kernel/sparse_flash_attention_q48_balance.h"
+ #include "sparse_flash_attention_tiling.h"
+ 
+ using std::map;
+@@ -522,6 +523,18 @@ void SFAMlaTiling::GetWorkspaceSize()
+         }
+         workspaceSize_ +=
+             (S2_BASE_SIZE * D_SIZE * SFAGetTypeSize(sfaInfo_->inputQType) * TRIPLE_BUFFER_NUM * sfaAicNum);
++        using namespace SFABalancedDecode;
++        if (sfaInfo_->isA6 && sfaAicNum == CORES && sfaInfo_->s1Size > 0 &&
++            sfaInfo_->gSize == HEADS && sfaInfo_->sparseBlockCount == INDEX_COUNT &&
++            sfaInfo_->qLayout == SFALayout::TND && sfaInfo_->kvLayout == SFALayout::PA_BSND &&
++            sfaInfo_->inputQType == ge::DT_BF16 && sfaInfo_->inputKvType == ge::DT_BF16 &&
++            sfaInfo_->n2Size == 1 && sfaInfo_->qkHeadDim == HEAD_DIM &&
++            sfaInfo_->vHeadDim == HEAD_DIM && sfaInfo_->ropeHeadDim == 64 &&
++            sfaInfo_->blockSize == TILE_ROWS && sfaInfo_->sparseBlockSize == 1 &&
++            sfaInfo_->sparseMode == 3 && sfaInfo_->actualQSeqLenFlag && sfaInfo_->actualSeqLenFlag &&
++            !sfaInfo_->returnSoftmaxLse && sfaInfo_->opParamInfo.sinks.tensor == nullptr) {
++            workspaceSize_ += WorkspaceBytes(sfaInfo_->s1Size);
++        }
+     } else {
+         uint32_t sfaMmResElemSize = 4;       // 4:fp32
+         uint32_t sfaVec1ResElemSize = 2;     // 2:fp16/bf16
+diff --git a/attention/sparse_flash_attention/op_kernel/arch92/sparse_flash_attention_kernel_mla_arch92.h b/attention/sparse_flash_attention/op_kernel/arch92/sparse_flash_attention_kernel_mla_arch92.h
+index 7a95a626..0fb09a97 100644
+--- a/attention/sparse_flash_attention/op_kernel/arch92/sparse_flash_attention_kernel_mla_arch92.h
++++ b/attention/sparse_flash_attention/op_kernel/arch92/sparse_flash_attention_kernel_mla_arch92.h
+@@ -58,6 +58,8 @@ public:
+ 
+ private:
+     __aicore__ inline void ProcessMainLoop();
++    __aicore__ inline bool CanBalanceDecode(__gm__ uint8_t* sinks);
++    __aicore__ inline void ProcessBalancedDecode();
+     __aicore__ inline void InitGlobalBuffer(__gm__ uint8_t* query, __gm__ uint8_t* key, __gm__ uint8_t* value,
+                                             __gm__ uint8_t* queryRope, __gm__ uint8_t* keyRope,
+                                             __gm__ uint8_t* sparseIndices, __gm__ uint8_t* blockTable,
+@@ -71,6 +73,7 @@ private:
+     __aicore__ inline void SetRunInfo(RunInfo& sfaRunInfo, RunParamStr& sfaRunParam, int64_t taskId,
+                                       int64_t s2LoopCount, int64_t s2LoopLimit, int64_t multiCoreInnerIdx);
+     __aicore__ inline void ComputeBmm1Tail(RunInfo& sfaRunInfo, RunParamStr& sfaRunParam);
++    __aicore__ inline bool CanWriteKvToL1(const RunInfo& runInfo);
+     __aicore__ inline void InitUniqueConstInfo();
+     __aicore__ inline void ComputeAxisIdxByBnAndGs1(int64_t bnIndex, int64_t gS1Index, RunParamStr& sfaRunParam);
+     __aicore__ inline void InitUniqueRunInfo(const RunParamStr& sfaRunParam, RunInfo& sfaRunInfo);
+@@ -98,6 +101,10 @@ private:
+     /* GM信息 */
+     __gm__ int32_t* actualSeqKvlenAddr = nullptr;
+     __gm__ int32_t* actualSeqQlenAddr = nullptr;
++    __gm__ int32_t* sparseIndicesAddr = nullptr;
++    __gm__ float* balancedPartials = nullptr;
++    bool useBalancedDecode = false;
++    uint32_t balancedQueries = 0;
+ 
+     GlobalTensor<int32_t> actualSeqLengthsQGm;
+     uint32_t usedCoreNum = 0U;
+@@ -179,7 +186,10 @@ __aicore__ inline void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType
+     this->ComputeConstexpr();
+     this->InitGlobalBuffer(query, key, value, queryRope, keyRope, sparseIndices, blockTable, actualSeqLengthsQ,
+                            actualSeqLengths, softmaxMax, softmaxSum, sinks, workspace, tiling, tPipe); // gm设置
+-    this->InitCalcParamsEach();
++    useBalancedDecode = CanBalanceDecode(sinks);
++    if (!useBalancedDecode) {
++        this->InitCalcParamsEach();
++    }
+     this->InitLocalBuffer();
+ }
+ 
+@@ -334,6 +344,9 @@ __aicore__ inline void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType
+         actualSeqKvlenAddr = (__gm__ int32_t*)actualSeqLengths;
+     }
+ 
++    if constexpr (SFAVectorService<TEMPLATE_INTF_ARGS>::CAN_USE_DIRECT_KV_L1) {
++        sparseIndicesAddr = reinterpret_cast<__gm__ int32_t*>(sparseIndices);
++    }
+     vecBlock.InitGlobalBuffer(key, value, keyRope, sparseIndices, blockTable, softmaxMax, softmaxSum, sinks);
+     cubeBlock.InitCubeInput(key, keyRope, sparseIndices, blockTable, actualSeqLengthsQ, sfaConstInfo);
+ }
+@@ -379,6 +392,11 @@ __aicore__ inline void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType
+         totalOffset = v0ResSize * 3 * aicIdx;
+     }
+     gmBufferManager.Init(workspace + totalOffset);
++    if constexpr (SFAVectorService<TEMPLATE_INTF_ARGS>::CAN_USE_DIRECT_KV_L1 &&
++                  IsSameType<Q_T, bfloat16_t>::value) {
++        balancedPartials = reinterpret_cast<__gm__ float*>(workspace +
++            static_cast<uint64_t>(v0ResSize) * 3 * GetBlockNum());
++    }
+     v0ResGmBuffers.Init(gmBufferManager, v0ResSize);
+     v0ResGmBuffers.Get().SetCrossCoreID(INVALID_CROSS_CORE_EVENT_ID, crossCoreSyncBufId);
+     crossCoreSyncBufId++;
+@@ -479,10 +497,158 @@ __aicore__ inline void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType
+         SyncAll<false>();
+     }
+ 
++    if constexpr (SFAVectorService<TEMPLATE_INTF_ARGS>::CAN_USE_DIRECT_KV_L1 &&
++                  IsSameType<Q_T, bfloat16_t>::value) {
++        if (useBalancedDecode) {
++            ProcessBalancedDecode();
++            FreeEvent();
++            return;
++        }
++    }
+     ProcessMainLoop();
+     FreeEvent();
+ }
+ 
++template <typename CubeBlockType, typename VecBlockType>
++__aicore__ inline bool SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType>::CanBalanceDecode(
++    __gm__ uint8_t* sinks)
++{
++    using namespace SFABalancedDecode;
++    if constexpr (SFAVectorService<TEMPLATE_INTF_ARGS>::CAN_USE_DIRECT_KV_L1 &&
++                  IsSameType<Q_T, bfloat16_t>::value) {
++        if (GetBlockNum() != CORES ||
++            sfaConstInfo.gSize != HEADS || sfaConstInfo.n2Size != 1 ||
++            sfaConstInfo.sparseBlockCount != INDEX_COUNT || sfaConstInfo.sparseBlockSize != 1 ||
++            sfaConstInfo.sparseMode != 3 || sharedParams.blockSize != TILE_ROWS ||
++            sharedParams.returnSoftmaxLse || sinks != nullptr || actualSeqQlenAddr == nullptr ||
++            actualSeqKvlenAddr == nullptr || sparseIndicesAddr == nullptr) {
++            return false;
++        }
++        // A batch can contain unequal query and KV lengths. The earliest query
++        // of every nonempty request must see a full 2048-index window.
++        int32_t previousEnd = 0;
++        for (uint32_t batch = 0; batch < sfaConstInfo.bSize; ++batch) {
++            const int32_t end = actualSeqQlenAddr[batch];
++            if (end < previousEnd || end > static_cast<int32_t>(sfaConstInfo.s1Size) ||
++                (end > previousEnd && actualSeqKvlenAddr[batch] <
++                 static_cast<int32_t>(INDEX_COUNT) + end - previousEnd - 1)) {
++                return false;
++            }
++            previousEnd = end;
++        }
++        balancedQueries = previousEnd;
++        if (!HasUsefulTileBudget(balancedQueries)) {
++            return false;
++        }
++        for (uint32_t query = 0; query < balancedQueries; ++query) {
++            if (sparseIndicesAddr[(static_cast<uint64_t>(query) + 1) * INDEX_COUNT - 1] < 0) {
++                return false;
++            }
++        }
++        return true;
++    }
++    return false;
++}
++
++template <typename CubeBlockType, typename VecBlockType>
++__aicore__ inline void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType>::ProcessBalancedDecode()
++{
++    using namespace SFABalancedDecode;
++    constexpr uint32_t RING_SIZE = 3;
++    RunInfo tiles[RING_SIZE]{};
++    uint32_t partialSlots[RING_SIZE]{};
++    bool retainedPartials[RING_SIZE]{};
++    uint32_t residentStatsBank = 0;
++    RunParamStr fragment{};
++    const uint32_t coreCapacity = TilesPerCore(balancedQueries);
++    const uint64_t workSize = static_cast<uint64_t>(balancedQueries) * TILES_PER_QUERY;
++    const uint64_t firstWork = Min(static_cast<uint64_t>(aicIdx) * coreCapacity, workSize);
++    const uint64_t endWork = Min(firstWork + coreCapacity, workSize);
++    const uint32_t tilesPerCore = endWork - firstWork;
++    uint32_t firstTile = 0;
++    uint32_t tileCount = 0;
++    uint32_t fragmentNumber = 0;
++    uint32_t batch = 0;
++    uint32_t batchStart = 0;
++    uint32_t batchEnd = actualSeqQlenAddr[0];
++    for (uint32_t task = 0; task < tilesPerCore + PRELOAD_NUM; ++task) {
++        if (task < tilesPerCore) {
++            const uint64_t work = firstWork + task;
++            const uint32_t query = work / TILES_PER_QUERY;
++            const uint32_t queryTile = work % TILES_PER_QUERY;
++            if (task == 0 || queryTile == 0) {
++                firstTile = queryTile;
++                tileCount = Min(TILES_PER_QUERY - firstTile, endWork - work);
++                ++fragmentNumber;
++                while (query >= batchEnd) {
++                    batchStart = batchEnd;
++                    batchEnd = actualSeqQlenAddr[++batch];
++                }
++                fragment.boIdx = batch;
++                fragment.n2oIdx = 0;
++                fragment.qSNumInOneBlock = 1;
++                ComputeParamBatch<TEMPLATE_INTF_ARGS>(fragment, sfaConstInfo, actualSeqQlenAddr, actualSeqKvlenAddr);
++                const uint32_t queryInBatch = query - batchStart;
++                ComputeAxisIdxByBnAndGs1(fragment.boIdx, queryInBatch, fragment);
++                ComputeParamS1<TEMPLATE_INTF_ARGS>(fragment, sfaConstInfo, queryInBatch, actualSeqQlenAddr);
++                fragment.s2LineStartIdx = 0;
++                fragment.s2LineEndIdx = tileCount * TILE_ROWS;
++                fragment.kvLoopEndIdx = tileCount;
++                fragment.s2LoopEndIdx = tileCount;
++            }
++            const uint32_t ring = task % RING_SIZE;
++            RunInfo& info = tiles[ring];
++            SetRunInfo(info, fragment, task, queryTile - firstTile, tileCount - 1, fragmentNumber);
++            const uint32_t firstOwner = static_cast<uint64_t>(query) * TILES_PER_QUERY / coreCapacity;
++            const uint32_t lastOwner = (static_cast<uint64_t>(query + 1) * TILES_PER_QUERY - 1) / coreCapacity;
++            const uint32_t part = aicIdx - firstOwner;
++            retainedPartials[ring] = part == 0 && lastOwner != firstOwner;
++            if (retainedPartials[ring]) {
++                residentStatsBank = info.multiCoreIdxMod2;
++            } else {
++                partialSlots[ring] = part == 0 ? UINT32_MAX : RemotePartialSlot(aicIdx, coreCapacity);
++            }
++            if ASCEND_IS_AIC {
++                cubeBlock.IterateBmm1(bmm1Buffers.Get(), l1RightBuffers.Get(), v0ResGmBuffers.Get(), info,
++                                      sfaConstInfo, true);
++            } else {
++                vecBlock.ProcessVec0(l1RightBuffers.Get(), v0ResGmBuffers.Get(), info, sfaConstInfo, true, firstTile);
++            }
++        }
++        if (task > 0 && task <= tilesPerCore) {
++            RunInfo& info = tiles[(task - 1) % RING_SIZE];
++            if ASCEND_IS_AIV {
++                vecBlock.ProcessVec1(l1RightBuffers.GetReused(), bmm1Buffers.Get(), info, sfaConstInfo);
++            } else {
++                cubeBlock.IterateBmm2(bmm2Buffers.Get(), l1RightBuffers, l1RightBuffers.GetReused(), info, sfaConstInfo);
++            }
++        }
++        if (task > 1) {
++            if ASCEND_IS_AIV {
++                const uint32_t ring = (task - 2) % RING_SIZE;
++                vecBlock.ProcessVec2(bmm2Buffers.Get(), tiles[ring], sfaConstInfo,
++                                     retainedPartials[ring] || partialSlots[ring] == UINT32_MAX ? nullptr : balancedPartials,
++                                     partialSlots[ring], retainedPartials[ring]);
++            }
++        }
++    }
++    if ASCEND_IS_AIV {
++        vecBlock.FinishBalancedPartial();
++        SyncAll();
++        // Whole queries were written directly. Only the final split query can
++        // belong to this core and still require a peer result.
++        if (tilesPerCore != 0) {
++            const uint32_t query = (endWork - 1) / TILES_PER_QUERY;
++            const uint32_t firstOwner = static_cast<uint64_t>(query) * TILES_PER_QUERY / coreCapacity;
++            const uint32_t lastOwner = (static_cast<uint64_t>(query + 1) * TILES_PER_QUERY - 1) / coreCapacity;
++            if (firstOwner == aicIdx && lastOwner != aicIdx) {
++                vecBlock.MergeBalancedQuery(balancedPartials, query, sfaConstInfo, coreCapacity,
++                                            lastOwner - aicIdx + 1, residentStatsBank, bmm2Buffers.Get());
++            }
++        }
++    }
++}
++
+ template <typename CubeBlockType, typename VecBlockType>
+ __aicore__ inline void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType>::FreeEvent()
+ {
+@@ -589,12 +755,13 @@ __aicore__ inline void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType
+                 if (sfaHasTwoPipelineStages) {
+                     RunInfo& runInfo1 = sfaRunInfo[taskId % 3];
+                     this->SetRunInfo(runInfo1, sfaRunParam, taskId, s2LoopCount, s2LoopLimit, multiCoreInnerIdx);
++                    const bool writeKvToL1 = CanWriteKvToL1(runInfo1);
+                     if ASCEND_IS_AIC {
+                         this->cubeBlock.IterateBmm1(this->bmm1Buffers.Get(), this->l1RightBuffers.Get(),
+-                                                    v0ResGmBuffers.Get(), runInfo1, this->sfaConstInfo);
++                                                    v0ResGmBuffers.Get(), runInfo1, this->sfaConstInfo, writeKvToL1);
+                     } else {
+                         this->vecBlock.ProcessVec0(this->l1RightBuffers.Get(), v0ResGmBuffers.Get(), runInfo1,
+-                                                   this->sfaConstInfo, 0);
++                                                   this->sfaConstInfo, writeKvToL1);
+                     }
+                 } else {
+                     if ASCEND_IS_AIV {
+@@ -657,6 +824,31 @@ __aicore__ inline void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType
+     }
+ }
+ 
++template <typename CubeBlockType, typename VecBlockType>
++__aicore__ inline bool SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType>::CanWriteKvToL1(
++    const RunInfo& runInfo)
++{
++    using VectorImplementation = SFAVectorService<TEMPLATE_INTF_ARGS>;
++    if constexpr (VectorImplementation::CAN_USE_DIRECT_KV_L1) {
++        if (actualSeqQlenAddr == nullptr || sparseIndicesAddr == nullptr ||
++            sharedParams.gSize != sfaConstInfo.s1BaseSize || sharedParams.s1Size <= sfaConstInfo.s1BaseSize / 2 ||
++            sharedParams.n2Size != 1 || sharedParams.blockSize != VectorImplementation::KV_PAGE_SIZE ||
++            sfaConstInfo.sparseBlockSize != 1 || sfaConstInfo.sparseMode != 3 ||
++            runInfo.s2RealSize != sfaConstInfo.s2BaseSize || runInfo.s2StartIdx != 0) {
++            return false;
++        }
++        const int64_t lastCol = (runInfo.s2LoopCount + 1) * sfaConstInfo.s2BaseSize - 1;
++        if (lastCol >= sfaConstInfo.sparseBlockCount) {
++            return false;
++        }
++        // A packed index row has one valid prefix and an optional -1 tail.
++        const int64_t batchStart = runInfo.boIdx == 0 ? 0 : actualSeqQlenAddr[runInfo.boIdx - 1];
++        const int64_t row = batchStart + runInfo.s1oIdx;
++        return sparseIndicesAddr[row * sfaConstInfo.sparseBlockCount + lastCol] >= 0;
++    }
++    return false;
++}
++
+ template <typename CubeBlockType, typename VecBlockType>
+ __aicore__ inline void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType>::SetRunInfo(
+     RunInfo& sfaRunInfo, RunParamStr& sfaRunParam, int64_t taskId, int64_t s2LoopCount, int64_t s2LoopLimit,
+diff --git a/attention/sparse_flash_attention/op_kernel/arch92/sparse_flash_attention_service_cube_mla_arch92.h b/attention/sparse_flash_attention/op_kernel/arch92/sparse_flash_attention_service_cube_mla_arch92.h
+index e7e6cb5b..d1908a66 100644
+--- a/attention/sparse_flash_attention/op_kernel/arch92/sparse_flash_attention_service_cube_mla_arch92.h
++++ b/attention/sparse_flash_attention/op_kernel/arch92/sparse_flash_attention_service_cube_mla_arch92.h
+@@ -70,7 +70,7 @@ public:
+     __aicore__ inline void IterateBmm1(Buffer<BufferType::UB, SyncType::CROSS_CORE_SYNC_BOTH>& output,
+                                        Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD>& inputRightBuf,
+                                        Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD>& v0ResGm,
+-                                       RunInfo& runInfo, ConstInfo& constInfo);
++                                       RunInfo& runInfo, ConstInfo& constInfo, bool kvInL1);
+ 
+     __aicore__ inline void IterateBmm2(
+         Buffer<BufferType::UB, SyncType::CROSS_CORE_SYNC_BOTH>& outputBuf,
+@@ -85,7 +85,7 @@ private:
+     __aicore__ inline void IterateBmm1SFA(Buffer<BufferType::UB, SyncType::CROSS_CORE_SYNC_BOTH>& outputBuf,
+                                           Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD>& inputRightBuf,
+                                           Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD>& v0ResGm,
+-                                          RunInfo& runInfo, ConstInfo& constInfo);
++                                          RunInfo& runInfo, ConstInfo& constInfo, bool kvInL1);
+     __aicore__ inline void PrepareLeftMatrixBmm1SFA(Buffer<BufferType::L1>& inputLeftBuf, RunInfo& runInfo,
+                                                     ConstInfo& constInfo);
+ 
+@@ -222,9 +222,10 @@ __aicore__ inline void SFAMatmulService<TEMPLATE_ARGS>::InitGmTensor(__gm__ uint
+ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAMatmulService<TEMPLATE_ARGS>::IterateBmm1(
+     Buffer<BufferType::UB, SyncType::CROSS_CORE_SYNC_BOTH>& outputBuf,
+     Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD>& inputRightBuf,
+-    Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD>& v0ResGm, RunInfo& runInfo, ConstInfo& constInfo)
++    Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD>& v0ResGm, RunInfo& runInfo, ConstInfo& constInfo,
++    bool kvInL1)
+ {
+-    IterateBmm1SFA(outputBuf, inputRightBuf, v0ResGm, runInfo, constInfo);
++    IterateBmm1SFA(outputBuf, inputRightBuf, v0ResGm, runInfo, constInfo, kvInL1);
+ }
+ 
+ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAMatmulService<TEMPLATE_ARGS>::IterateBmm2(
+@@ -238,25 +239,30 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAMatmulService<TEMPLATE_ARGS>:
+ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAMatmulService<TEMPLATE_ARGS>::IterateBmm1SFA(
+     Buffer<BufferType::UB, SyncType::CROSS_CORE_SYNC_BOTH>& outputBuf,
+     Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD>& inputRightBuf,
+-    Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD>& v0ResGm, RunInfo& runInfo, ConstInfo& constInfo)
++    Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD>& v0ResGm, RunInfo& runInfo, ConstInfo& constInfo,
++    bool kvInL1)
+ {
+     Buffer<BufferType::L1> inputLeftBuf;
+     PrepareLeftMatrixBmm1SFA(inputLeftBuf, runInfo, constInfo);
+ 
+-    SetFlag<HardEvent::MTE1_MTE2>(mte2ToMte1Id[runInfo.taskIdMod3]);
+-    WaitFlag<HardEvent::MTE1_MTE2>(mte2ToMte1Id[runInfo.taskIdMod3]);
+-    LocalTensor<Q_T> dst = inputRightBuf.GetTensor<Q_T>();
+-    v0ResGm.WaitCrossCore();
+-    GlobalTensor<Q_T> v0ResGmTensor = v0ResGm.template GetTensor<Q_T>();
+-    if constexpr (HAS_ROPE) {
+-        CopyToL1Nd2Nz<Q_T>(dst, v0ResGmTensor, runInfo.s2RealSize,
+-                           dSizeCombined,  // 576: 表示 KV Cache 单 Token 的特征宽度;
+-                           dSizeCombined); // 576: 同上
++    if (kvInL1) {
++        inputRightBuf.WaitCrossCore();
+     } else {
+-        CopyToL1Nd2Nz<Q_T>(dst, v0ResGmTensor, runInfo.s2RealSize, dSizeNope, dSizeNope); // 512: 同上
++        SetFlag<HardEvent::MTE1_MTE2>(mte2ToMte1Id[runInfo.taskIdMod3]);
++        WaitFlag<HardEvent::MTE1_MTE2>(mte2ToMte1Id[runInfo.taskIdMod3]);
++        LocalTensor<Q_T> dst = inputRightBuf.GetTensor<Q_T>();
++        v0ResGm.WaitCrossCore();
++        GlobalTensor<Q_T> v0ResGmTensor = v0ResGm.template GetTensor<Q_T>();
++        if constexpr (HAS_ROPE) {
++            CopyToL1Nd2Nz<Q_T>(dst, v0ResGmTensor, runInfo.s2RealSize,
++                               dSizeCombined,  // 576: 表示 KV Cache 单 Token 的特征宽度;
++                               dSizeCombined); // 576: 同上
++        } else {
++            CopyToL1Nd2Nz<Q_T>(dst, v0ResGmTensor, runInfo.s2RealSize, dSizeNope, dSizeNope); // 512: 同上
++        }
++        SetFlag<HardEvent::MTE2_MTE1>(mte1ToMte2Id[runInfo.taskIdMod3]);
++        WaitFlag<HardEvent::MTE2_MTE1>(mte1ToMte2Id[runInfo.taskIdMod3]);
+     }
+-    SetFlag<HardEvent::MTE2_MTE1>(mte1ToMte2Id[runInfo.taskIdMod3]);
+-    WaitFlag<HardEvent::MTE2_MTE1>(mte1ToMte2Id[runInfo.taskIdMod3]);
+ 
+     inputLeftBuf.Wait<HardEvent::MTE2_MTE1>(); // 等待L1A
+     Buffer<BufferType::L0C> mm1ResL0C = mmL0CBuffers.Get();
+diff --git a/attention/sparse_flash_attention/op_kernel/arch92/sparse_flash_attention_service_vector_mla_arch92.h b/attention/sparse_flash_attention/op_kernel/arch92/sparse_flash_attention_service_vector_mla_arch92.h
+index f81d08a1..22d13e9e 100644
+--- a/attention/sparse_flash_attention/op_kernel/arch92/sparse_flash_attention_service_vector_mla_arch92.h
++++ b/attention/sparse_flash_attention/op_kernel/arch92/sparse_flash_attention_service_vector_mla_arch92.h
+@@ -26,6 +26,7 @@
+ #include "../../../common/op_kernel/buffers_policy.h"
+ #include "../../../common/op_kernel/attn_buffer_manager.h"
+ #include "../../../common/op_kernel/attn_buffer.h"
++#include "../sparse_flash_attention_q48_balance.h"
+ 
+ using namespace AscendC;
+ using namespace FaVectorApi;
+@@ -35,6 +36,138 @@ using namespace matmul;
+ 
+ namespace BaseApi {
+ 
++__simd_vf__ inline void ComputeThreePartMergeWeights(__ubuf__ float* stats)
++{
++    constexpr uint32_t heads = SFABalancedDecode::HEADS;
++    Reg::RegTensor<float> maxima[3];
++    Reg::RegTensor<float> sums[3];
++    Reg::RegTensor<float> globalMax;
++    Reg::RegTensor<float> denominator;
++    Reg::MaskReg all = Reg::CreateMask<float, Reg::MaskPattern::ALL>();
++#pragma unroll
++    for (uint32_t part = 0; part < 3; ++part) {
++        Reg::LoadAlign(maxima[part], stats + (2 * part) * heads);
++        Reg::LoadAlign(sums[part], stats + (2 * part + 1) * heads);
++    }
++    Reg::Max(globalMax, maxima[0], maxima[1], all);
++    Reg::Max(globalMax, globalMax, maxima[2], all);
++#pragma unroll
++    for (uint32_t part = 0; part < 3; ++part) {
++        Reg::Sub(maxima[part], maxima[part], globalMax, all);
++        Reg::Exp(maxima[part], maxima[part], all);
++        Reg::Mul(sums[part], sums[part], maxima[part], all);
++    }
++    Reg::Add(denominator, sums[0], sums[1], all);
++    Reg::Add(denominator, denominator, sums[2], all);
++#pragma unroll
++    for (uint32_t part = 0; part < 3; ++part) {
++        Reg::Div(sums[part], sums[part], denominator, all);
++        Reg::StoreAlign<float, Reg::StoreDist::DIST_NORM_B32>(stats + part * heads, sums[part], all);
++    }
++}
++
++__simd_vf__ inline void MergeThreePartRows(__ubuf__ float* data, __ubuf__ float* weights, uint16_t firstRow)
++{
++    constexpr uint32_t rowsPerChunk = 16;
++    constexpr uint32_t dim = SFABalancedDecode::HEAD_DIM;
++    constexpr uint32_t chunkElements = rowsPerChunk * dim;
++    constexpr uint32_t registerElements = 64;
++    Reg::MaskReg all = Reg::CreateMask<float, Reg::MaskPattern::ALL>();
++    Reg::RegTensor<float> w[3];
++    Reg::RegTensor<float> v[3];
++    for (uint16_t row = 0; row < rowsPerChunk; ++row) {
++#pragma unroll
++        for (uint32_t part = 0; part < 3; ++part) {
++            Reg::LoadAlign<float, Reg::LoadDist::DIST_BRC_B32>(w[part],
++                weights + part * SFABalancedDecode::HEADS + firstRow + row);
++        }
++        for (uint16_t col = 0; col < dim; col += registerElements) {
++            const uint32_t offset = row * dim + col;
++#pragma unroll
++            for (uint32_t part = 0; part < 3; ++part) {
++                Reg::LoadAlign(v[part], data + part * chunkElements + offset);
++                Reg::Mul(v[part], v[part], w[part], all);
++            }
++            Reg::Add(v[0], v[0], v[1], all);
++            Reg::Add(v[0], v[0], v[2], all);
++            Reg::StoreAlign<float, Reg::StoreDist::DIST_NORM_B32>(data + offset, v[0], all);
++        }
++    }
++}
++
++__simd_vf__ inline void ComputeTwoPartMergeWeights(__ubuf__ float* stats)
++{
++    Reg::RegTensor<float> max0;
++    Reg::RegTensor<float> max1;
++    Reg::RegTensor<float> sum0;
++    Reg::RegTensor<float> sum1;
++    Reg::RegTensor<float> globalMax;
++    Reg::RegTensor<float> denominator;
++    Reg::MaskReg all = Reg::CreateMask<float, Reg::MaskPattern::ALL>();
++
++    Reg::LoadAlign(max0, stats);
++    Reg::LoadAlign(sum0, stats + SFABalancedDecode::HEADS);
++    Reg::LoadAlign(max1, stats + 2 * SFABalancedDecode::HEADS);
++    Reg::LoadAlign(sum1, stats + 3 * SFABalancedDecode::HEADS);
++    Reg::Max(globalMax, max0, max1, all);
++    Reg::Sub(max0, max0, globalMax, all);
++    Reg::Sub(max1, max1, globalMax, all);
++    Reg::Exp(max0, max0, all);
++    Reg::Exp(max1, max1, all);
++    Reg::Mul(sum0, sum0, max0, all);
++    Reg::Mul(sum1, sum1, max1, all);
++    Reg::Add(denominator, sum0, sum1, all);
++    Reg::Div(sum0, sum0, denominator, all);
++    Reg::Div(sum1, sum1, denominator, all);
++    Reg::StoreAlign<float, Reg::StoreDist::DIST_NORM_B32>(stats, sum0, all);
++    Reg::StoreAlign<float, Reg::StoreDist::DIST_NORM_B32>(stats + SFABalancedDecode::HEADS, sum1, all);
++}
++
++__simd_vf__ inline void MergeTwoPartRows(__ubuf__ float* left, __ubuf__ float* right,
++                                          __ubuf__ float* weight0, __ubuf__ float* weight1, uint16_t rows)
++{
++    constexpr uint16_t registerElements = 64;
++    Reg::RegTensor<float> leftValue;
++    Reg::RegTensor<float> rightValue;
++    Reg::RegTensor<float> leftWeight;
++    Reg::RegTensor<float> rightWeight;
++    Reg::MaskReg all = Reg::CreateMask<float, Reg::MaskPattern::ALL>();
++    for (uint16_t row = 0; row < rows; ++row) {
++        Reg::LoadAlign<float, Reg::LoadDist::DIST_BRC_B32>(leftWeight, weight0 + row);
++        Reg::LoadAlign<float, Reg::LoadDist::DIST_BRC_B32>(rightWeight, weight1 + row);
++        for (uint16_t col = 0; col < SFABalancedDecode::HEAD_DIM; col += registerElements) {
++            uint32_t offset = row * SFABalancedDecode::HEAD_DIM + col;
++            Reg::LoadAlign(leftValue, left + offset);
++            Reg::LoadAlign(rightValue, right + offset);
++            Reg::Mul(leftValue, leftValue, leftWeight, all);
++            Reg::Mul(rightValue, rightValue, rightWeight, all);
++            Reg::Add(leftValue, leftValue, rightValue, all);
++            Reg::StoreAlign<float, Reg::StoreDist::DIST_NORM_B32>(left + offset, leftValue, all);
++        }
++    }
++}
++
++__simd_vf__ inline void AccumulateBalancedRows(__ubuf__ float* output, __ubuf__ float* peer,
++                                              __ubuf__ float* peerWeights)
++{
++    constexpr uint16_t registerElements = 64;
++    Reg::RegTensor<float> current;
++    Reg::RegTensor<float> other;
++    Reg::RegTensor<float> weight;
++    Reg::MaskReg all = Reg::CreateMask<float, Reg::MaskPattern::ALL>();
++    for (uint16_t row = 0; row < SFABalancedDecode::HEADS; ++row) {
++        Reg::LoadAlign<float, Reg::LoadDist::DIST_BRC_B32>(weight, peerWeights + row);
++        for (uint16_t col = 0; col < SFABalancedDecode::HEAD_DIM; col += registerElements) {
++            const uint32_t offset = row * SFABalancedDecode::HEAD_DIM + col;
++            Reg::LoadAlign(current, output + offset);
++            Reg::LoadAlign(other, peer + offset);
++            Reg::Mul(other, other, weight, all);
++            Reg::Add(current, current, other, all);
++            Reg::StoreAlign<float, Reg::StoreDist::DIST_NORM_B32>(output + offset, current, all);
++        }
++    }
++}
++
+ TEMPLATES_DEF
+ class SFAVectorService {
+ public:
+@@ -52,6 +185,15 @@ public:
+     static constexpr uint32_t dSizeCombined = 576;
+     static constexpr float R0 = 1.0f;
+     static constexpr uint64_t SYNC_SINKS_BUF_FLAG = 6;
++    static constexpr uint32_t KV_PAGE_SHIFT = 7;
++    static constexpr uint32_t KV_PAGE_SIZE = 1U << KV_PAGE_SHIFT;
++    static constexpr uint32_t KV_PAGE_MASK = KV_PAGE_SIZE - 1;
++    static constexpr uint16_t DIRECT_KV_NZ_PITCH = 16;
++    static constexpr bool CAN_USE_FIXED_PAGE_ADDRESSING =
++        !isFd && isPa && LAYOUT_T == SFA_LAYOUT::TND && KV_LAYOUT_T == SFA_LAYOUT::PA_BSND &&
++        !IS_SPLIT_G && HAS_ROPE && (IsSameType<KV_T, half>::value || IsSameType<KV_T, bfloat16_t>::value);
++    static constexpr bool CAN_USE_DIRECT_KV_L1 = CAN_USE_FIXED_PAGE_ADDRESSING &&
++        TEMPLATE_MODE == SFATemplateMode::CFA_TEMPLATE_MODE && IsSameType<Q_T, KV_T>::value;
+ 
+     // ==================== Functions ======================
+     __aicore__ inline SFAVectorService(){};
+@@ -87,12 +229,19 @@ public:
+     __aicore__ inline void InitOutputSingleCore(ConstInfo& constInfo);
+     __aicore__ inline void ProcessVec0(Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD>& outputL1,
+                                        Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD>& v0ResGm,
+-                                       const RunInfo& runInfo, ConstInfo& constInfo, int32_t startPos);
++                                       const RunInfo& runInfo, ConstInfo& constInfo, bool writeKvToL1,
++                                       uint32_t firstKvTile = 0);
+     __aicore__ inline void ProcessVec1(Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD>& outputBuf,
+                                        Buffer<BufferType::UB, SyncType::CROSS_CORE_SYNC_BOTH>& bmm1ResBuf,
+                                        RunInfo& runInfo, ConstInfo& constInfo);
+     using mm2ResPos = Buffer<BufferType::UB, SyncType::CROSS_CORE_SYNC_BOTH>;
+-    __aicore__ inline void ProcessVec2(mm2ResPos& bmm2ResBuf, RunInfo& runInfo, ConstInfo& constInfo);
++    __aicore__ inline void ProcessVec2(mm2ResPos& bmm2ResBuf, RunInfo& runInfo, ConstInfo& constInfo,
++                                       __gm__ float* partialWorkspace = nullptr, uint32_t partialSlot = 0,
++                                       bool retainLocal = false);
++    __aicore__ inline void FinishBalancedPartial();
++    __aicore__ inline void MergeBalancedQuery(__gm__ float* partialWorkspace, uint32_t query, ConstInfo& constInfo,
++                                             uint32_t coreCapacity, uint32_t parts, uint32_t statsBank,
++                                             mm2ResPos& bmm2Scratch);
+ 
+ private:
+     __aicore__ inline void ProcessVec1SoftmaxDispatchSFA(LocalTensor<Q_T>& stage1CastTensor, LocalTensor<T>& mmRes,
+@@ -101,18 +250,41 @@ private:
+                                                          ConstInfo& constInfo);
+     __aicore__ inline void ProcessSparseKv(Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD>& outputL1,
+                                            Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD>& v0ResGm,
+-                                           const RunInfo& runInfo, ConstInfo& constInfo, int32_t startPos);
++                                           const RunInfo& runInfo, ConstInfo& constInfo, bool writeKvToL1,
++                                           uint32_t firstKvTile);
++    __aicore__ inline void StoreBalancedPartial(__gm__ float* partialWorkspace, uint32_t partialSlot,
++                                                const RunInfo& runInfo, LocalTensor<T>& partial);
++    struct SparseKvAddressBases {
++        int64_t sparseTileOffset = 0;
++        int64_t sparseGmBase = 0;
++        int64_t pageTableRow = 0;
++        int64_t keyStride = 0;
++    };
++    template <bool UseFixedPageAddressing, bool WriteKvToL1 = false>
++    __aicore__ inline void ProcessSparseKvImpl(
++        Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD>& outputL1,
++        Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD>& v0ResGm,
++        const RunInfo& runInfo, ConstInfo& constInfo, uint32_t firstKvTile = 0);
+     __aicore__ inline int64_t GetkeyOffset(int64_t s2Idx, const RunInfo& runInfo, ConstInfo& constInfo);
++    __aicore__ inline int64_t GetSparseRowOffset(const RunInfo& runInfo, const ConstInfo& constInfo);
++    template <bool UseFixedPageAddressing>
+     __aicore__ inline void GetRealCmpS2Idx(int64_t& token0Idx, int64_t& token1Idx, int64_t s2IdxInBase,
+-                                           const RunInfo& runInfo, ConstInfo& constInfo);
++                                           const RunInfo& runInfo, ConstInfo& constInfo,
++                                           const SparseKvAddressBases& addressBases);
+     __aicore__ inline void CopyInKvNotSparse(LocalTensor<KV_T> kvMergUb, int64_t v0Loop, int64_t dealRow,
+                                              int64_t s2StartIdx, const RunInfo& runInfo, ConstInfo& constInfo);
++    template <bool UseFixedPageAddressing, bool WriteKvToL1>
+     __aicore__ inline uint32_t CopyInKvSparse(LocalTensor<KV_T> kvInUb, int64_t startRow, int64_t token0Idx,
+-                                              int64_t token1Idx, const RunInfo& runInfo, ConstInfo& constInfo);
++                                              int64_t token1Idx, const RunInfo& runInfo, ConstInfo& constInfo,
++                                              const SparseKvAddressBases& addressBases);
+     __aicore__ inline void CalSparseCalSize(const RunInfo& runInfo, ConstInfo& constInfo);
+     __aicore__ inline void CopyOutKvUb2Gm(Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD>& v0ResGm,
+                                           LocalTensor<Q_T> kvOutUb, int64_t dealRow, int64_t s2StartIdx,
+                                           const RunInfo& runInfo, ConstInfo& constInfo);
++    __aicore__ inline void CopyOutKvUb2L1(
++        Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD>& outputL1, LocalTensor<Q_T> kvNz,
++        int64_t dealRow, int64_t s2StartIdx, const RunInfo& runInfo);
++    template <bool WriteKvToL1>
+     __aicore__ inline void CopyInSingleKv(LocalTensor<KV_T> kvInUb, int64_t startRow, int64_t keyOffset,
+                                           ConstInfo& constInfo);
+     /* VEC2_RES_T 表示bmm2ResUb当前的类型，VEC2_RES_T = Q_T那么不需要做Cast。另外，无效行场景当前默认需要做Cast */
+@@ -164,6 +336,7 @@ private:
+     TBuf<> vselrIndexesBuf[2];
+ 
+     TEventID mte2ToV;
++    TEventID kvSlotReadyToMte3;
+     TEventID mte2ToMte3[2];
+     TEventID mte3ToMte2[2];
+ 
+@@ -179,29 +352,44 @@ private:
+     TEventID initOutputEventId;
+ };
+ 
+-TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>::GetRealCmpS2Idx(
+-    int64_t& token0Idx, int64_t& token1Idx, int64_t s2IdxInBase, const RunInfo& runInfo, ConstInfo& constInfo)
++TEMPLATES_DEF_NO_DEFAULT
++__aicore__ inline int64_t SFAVectorService<TEMPLATE_ARGS>::GetSparseRowOffset(
++    const RunInfo& runInfo, const ConstInfo& constInfo)
+ {
+-    int64_t topkBS1Idx = 0;
+     if constexpr (LAYOUT_T == SFA_LAYOUT::TND) {
+         uint64_t actualSeqQPrefixSum = runInfo.boIdx == 0 ? 0 : cuSeqlensQGm.GetValue(runInfo.boIdx - 1);
+-        topkBS1Idx += (actualSeqQPrefixSum + runInfo.s1oIdx) * constInfo.sparseBlockCount; // T, N2(1), K
++        return (actualSeqQPrefixSum + runInfo.s1oIdx) * constInfo.sparseBlockCount; // T, N2(1), K
++    } else {
++        return runInfo.boIdx * constInfo.s1Size * constInfo.sparseBlockCount +
++               runInfo.s1oIdx * constInfo.sparseBlockCount; // B, S1, N2(1), K
++    }
++}
++
++TEMPLATES_DEF_NO_DEFAULT
++template <bool UseFixedPageAddressing>
++__aicore__ inline void SFAVectorService<TEMPLATE_ARGS>::GetRealCmpS2Idx(
++    int64_t& token0Idx, int64_t& token1Idx, int64_t s2IdxInBase, const RunInfo& runInfo, ConstInfo& constInfo,
++    const SparseKvAddressBases& addressBases)
++{
++    int64_t topkKIdx;
++    int64_t firstGmIdx;
++    if constexpr (UseFixedPageAddressing) {
++        topkKIdx = s2IdxInBase + addressBases.sparseTileOffset;
++        firstGmIdx = addressBases.sparseGmBase + s2IdxInBase;
+     } else {
+-        topkBS1Idx += runInfo.boIdx * constInfo.s1Size * constInfo.sparseBlockCount +
+-                      runInfo.s1oIdx * constInfo.sparseBlockCount; // B, S1, N2(1), K
++        topkKIdx = s2IdxInBase + runInfo.s2LoopCount * constInfo.s2BaseSize;
++        firstGmIdx = GetSparseRowOffset(runInfo, constInfo) + topkKIdx;
+     }
+-    int64_t cmpS2LoopCnt = runInfo.s2LoopCount;
+-    int64_t topkKIdx = s2IdxInBase + cmpS2LoopCnt * constInfo.s2BaseSize;
+     if (unlikely(topkKIdx >= constInfo.sparseBlockCount)) {
+         token0Idx = -1;
+     } else {
+-        token0Idx = sparseIndicesGm.GetValue(topkBS1Idx + topkKIdx) + runInfo.s2StartIdx;
++        token0Idx = sparseIndicesGm.GetValue(firstGmIdx) + runInfo.s2StartIdx;
+     }
+     topkKIdx += 1;
+     if (unlikely((topkKIdx >= constInfo.sparseBlockCount) || (s2IdxInBase + 1 >= sparseS2End))) {
+         token1Idx = -1;
+     } else {
+-        token1Idx = sparseIndicesGm.GetValue(topkBS1Idx + topkKIdx) + runInfo.s2StartIdx;
++        token1Idx = sparseIndicesGm.GetValue(firstGmIdx + 1) + runInfo.s2StartIdx;
+     }
+ }
+ 
+@@ -230,13 +418,30 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline int64_t SFAVectorService<TEMPLATE_ARG
+     return realkeyOffset;
+ }
+ 
+-TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>::CopyInSingleKv(
++TEMPLATES_DEF_NO_DEFAULT
++template <bool WriteKvToL1>
++__aicore__ inline void SFAVectorService<TEMPLATE_ARGS>::CopyInSingleKv(
+     LocalTensor<KV_T> kvInUb, int64_t startRow, int64_t keyOffset, ConstInfo& constInfo)
+ {
+     if (keyOffset < 0) {
+         return;
+     }
+     DataCopyExtParams sfaIntriParams;
++    if constexpr (WriteKvToL1) {
++        constexpr uint16_t blockElements = BUFFER_SIZE_BYTE_32B / sizeof(KV_T);
++        const int64_t nzRow = startRow * blockElements;
++        // GM features are contiguous. UB skips the remaining token rows of each NZ feature block.
++        sfaIntriParams.blockLen = BUFFER_SIZE_BYTE_32B;
++        sfaIntriParams.srcStride = 0;
++        sfaIntriParams.dstStride = DIRECT_KV_NZ_PITCH - 1;
++        DataCopyPadExtParams<KV_T> noPadding{false, 0, 0, 0};
++        sfaIntriParams.blockCount = dSizeNope / blockElements;
++        DataCopyPad(kvInUb[nzRow], keyGm[keyOffset * dSizeNope], sfaIntriParams, noPadding);
++        sfaIntriParams.blockCount = dSizeRope / blockElements;
++        DataCopyPad(kvInUb[dSizeNope * DIRECT_KV_NZ_PITCH + nzRow],
++                    keyRopeGm[keyOffset * dSizeRope], sfaIntriParams, noPadding);
++        return;
++    }
+ 
+     sfaIntriParams.blockCount = 1;
+     sfaIntriParams.dstStride = 0;
+@@ -261,12 +466,33 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>:
+     }
+ }
+ 
+-TEMPLATES_DEF_NO_DEFAULT __aicore__ inline uint32_t SFAVectorService<TEMPLATE_ARGS>::CopyInKvSparse(
++TEMPLATES_DEF_NO_DEFAULT
++template <bool UseFixedPageAddressing, bool WriteKvToL1>
++__aicore__ inline uint32_t SFAVectorService<TEMPLATE_ARGS>::CopyInKvSparse(
+     LocalTensor<KV_T> kvInUb, int64_t startRow, int64_t token0Idx, int64_t token1Idx, const RunInfo& runInfo,
+-    ConstInfo& constInfo)
++    ConstInfo& constInfo, const SparseKvAddressBases& addressBases)
+ {
+-    int64_t keyOffset0 = GetkeyOffset(token0Idx, runInfo, constInfo);
+-    int64_t keyOffset1 = GetkeyOffset(token1Idx, runInfo, constInfo);
++    int64_t keyOffset0 = -1;
++    int64_t keyOffset1 = -1;
++    if constexpr (UseFixedPageAddressing) {
++        int64_t page0 = -1;
++        int64_t pageBase0 = 0;
++        if (token0Idx >= 0) {
++            page0 = token0Idx >> KV_PAGE_SHIFT;
++            pageBase0 = blockTableGm.GetValue(addressBases.pageTableRow + page0) * addressBases.keyStride;
++            keyOffset0 = pageBase0 + (token0Idx & KV_PAGE_MASK);
++        }
++        if (token1Idx >= 0) {
++            const int64_t page1 = token1Idx >> KV_PAGE_SHIFT;
++            // Reuse a physical page base only when both tokens address this logical page.
++            const int64_t pageBase1 = page1 == page0 ? pageBase0 :
++                blockTableGm.GetValue(addressBases.pageTableRow + page1) * addressBases.keyStride;
++            keyOffset1 = pageBase1 + (token1Idx & KV_PAGE_MASK);
++        }
++    } else {
++        keyOffset0 = GetkeyOffset(token0Idx, runInfo, constInfo);
++        keyOffset1 = GetkeyOffset(token1Idx, runInfo, constInfo);
++    }
+     if (unlikely(keyOffset0 < 0 && keyOffset1 < 0)) {
+         return 0;
+     }
+@@ -278,11 +504,16 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline uint32_t SFAVectorService<TEMPLATE_AR
+         keyRopeSrcStride = blkTableSrcStride * dSizeRope * sizeof(KV_T);
+     }
+     if (unlikely(keyOffset1 < 0)) {
+-        CopyInSingleKv(kvInUb, startRow, keyOffset0, constInfo);
++        CopyInSingleKv<WriteKvToL1>(kvInUb, startRow, keyOffset0, constInfo);
+     } else if (keySrcStride >= INT32_MAX || keySrcStride < 0 || constInfo.sparseBlockSize > 1) {
+         // stride溢出、stride为负数、s2超长等异常场景，还原成2条搬运指令
+-        CopyInSingleKv(kvInUb, startRow, keyOffset0, constInfo);
+-        CopyInSingleKv(kvInUb, startRow + 1, keyOffset1, constInfo);
++        CopyInSingleKv<WriteKvToL1>(kvInUb, startRow, keyOffset0, constInfo);
++        CopyInSingleKv<WriteKvToL1>(kvInUb, startRow + 1, keyOffset1, constInfo);
++    } else if constexpr (WriteKvToL1) {
++        // Match the paired DMA's original ascending physical order for a representable stride.
++        const bool token0First = keyOffset0 >= 0 && keyOffset0 < keyOffset1;
++        CopyInSingleKv<true>(kvInUb, startRow, token0First ? keyOffset0 : keyOffset1, constInfo);
++        CopyInSingleKv<true>(kvInUb, startRow + 1, token0First ? keyOffset1 : keyOffset0, constInfo);
+     } else {
+         DataCopyExtParams intriParams;
+         intriParams.blockCount = (keyOffset0 >= 0) + (keyOffset1 >= 0);
+@@ -360,6 +591,20 @@ __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>::CopyOutKvUb2Gm(
+              dealRow * dVTemplateTypeInput); // dVTemplateTypeInput: KV Cache 每 Token 的特征宽度
+ }
+ 
++TEMPLATES_DEF_NO_DEFAULT
++__aicore__ inline void SFAVectorService<TEMPLATE_ARGS>::CopyOutKvUb2L1(
++    Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD>& outputL1, LocalTensor<Q_T> kvNz,
++    int64_t dealRow, int64_t s2StartIdx, const RunInfo& runInfo)
++{
++    constexpr uint16_t blockElements = BUFFER_SIZE_BYTE_32B / sizeof(Q_T);
++    DataCopyParams copyParams;
++    copyParams.blockCount = dSizeCombined / blockElements;
++    copyParams.blockLen = dealRow;
++    copyParams.srcGap = DIRECT_KV_NZ_PITCH - dealRow;
++    copyParams.dstGap = runInfo.s2RealSize - dealRow;
++    DataCopy(outputL1.template GetTensor<Q_T>()[s2StartIdx * blockElements], kvNz, copyParams);
++}
++
+ TEMPLATES_DEF_NO_DEFAULT
+ __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>::CalSparseCalSize(const RunInfo& runInfo, ConstInfo& constInfo)
+ {
+@@ -385,29 +630,64 @@ __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>::CalSparseCalSize(const R
+ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>::ProcessVec0(
+     Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD>& outputL1,
+     Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD>& v0ResGm, const RunInfo& runInfo, ConstInfo& constInfo,
+-    int32_t startPos)
++    bool writeKvToL1, uint32_t firstKvTile)
+ {
+     blockSize = constInfo.blockSize;
+     maxBlockNumPerBatch = constInfo.maxBlockNumPerBatch;
+ 
+     CalSparseCalSize(runInfo, constInfo);
+-    ProcessSparseKv(outputL1, v0ResGm, runInfo, constInfo, startPos);
++    ProcessSparseKv(outputL1, v0ResGm, runInfo, constInfo, writeKvToL1, firstKvTile);
+ 
+     if constexpr (IS_SPLIT_G) {
+         CrossCoreSetFlag<0, PIPE_MTE3>(15);  // 15: 跨核同步标志位值
+         CrossCoreWaitFlag<0, PIPE_MTE3>(15); // 15: 跨核同步标志位值
+     }
+-    v0ResGm.SetCrossCore();
++    if (writeKvToL1) {
++        outputL1.SetCrossCore();
++    } else {
++        v0ResGm.SetCrossCore();
++    }
+ }
+ 
+ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>::ProcessSparseKv(
+     Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD>& outputL1,
+     Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD>& v0ResGm, const RunInfo& runInfo, ConstInfo& constInfo,
+-    int32_t startPos)
++    bool writeKvToL1, uint32_t firstKvTile)
+ {
+     if (sfaSparseCalSize == 0) {
+         return;
+     }
++    if constexpr (CAN_USE_DIRECT_KV_L1) {
++        if (writeKvToL1) {
++            ProcessSparseKvImpl<true, true>(outputL1, v0ResGm, runInfo, constInfo, firstKvTile);
++            return;
++        }
++    }
++    if constexpr (CAN_USE_FIXED_PAGE_ADDRESSING) {
++        const auto& baseParams = tilingData->baseParams;
++        if (baseParams.nNumOfQInOneGroup == s1BaseSize && baseParams.qSeqSize > s1BaseSize / 2 &&
++            constInfo.blockSize == KV_PAGE_SIZE && constInfo.sparseBlockSize == 1 && constInfo.sparseMode == 3) {
++            ProcessSparseKvImpl<true>(outputL1, v0ResGm, runInfo, constInfo);
++            return;
++        }
++    }
++    ProcessSparseKvImpl<false>(outputL1, v0ResGm, runInfo, constInfo);
++}
++
++TEMPLATES_DEF_NO_DEFAULT
++template <bool UseFixedPageAddressing, bool WriteKvToL1>
++__aicore__ inline void SFAVectorService<TEMPLATE_ARGS>::ProcessSparseKvImpl(
++    Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD>& outputL1,
++    Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD>& v0ResGm, const RunInfo& runInfo, ConstInfo& constInfo,
++    uint32_t firstKvTile)
++{
++    SparseKvAddressBases addressBases{};
++    if constexpr (UseFixedPageAddressing) {
++        addressBases.sparseTileOffset = (firstKvTile + runInfo.s2LoopCount) * constInfo.s2BaseSize;
++        addressBases.sparseGmBase = GetSparseRowOffset(runInfo, constInfo) + addressBases.sparseTileOffset;
++        addressBases.pageTableRow = runInfo.boIdx * maxBlockNumPerBatch;
++        addressBases.keyStride = constInfo.keyStride0;
++    }
+     bool meetEnd = false;
+     int64_t s2Start = sparseS2Start;
+     int64_t s2 = sparseS2Start;
+@@ -421,13 +701,14 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>:
+         LocalTensor<Q_T> stage0OutUb = this->stage0OutBuf[pingPong].template Get<Q_T>();
+         WaitFlag<HardEvent::MTE3_MTE2>(mte3ToMte2[pingPong]);
+         while (dealRow < Min(16, sfaSparseCalSize) && s2 < sparseS2End) { // 拷贝满16行或者遇到-1
+-            GetRealCmpS2Idx(token0Idx, token1Idx, s2, runInfo, constInfo);
++            GetRealCmpS2Idx<UseFixedPageAddressing>(token0Idx, token1Idx, s2, runInfo, constInfo, addressBases);
+             s2 += 2; // 每次搬运2行
+             if (token0Idx == -1 && token1Idx == -1) {
+                 meetEnd = true;
+                 break;
+             }
+-            dealRow += CopyInKvSparse(stage0OutUb, dealRow, token0Idx, token1Idx, runInfo, constInfo);
++            dealRow += CopyInKvSparse<UseFixedPageAddressing, WriteKvToL1>(
++                stage0OutUb, dealRow, token0Idx, token1Idx, runInfo, constInfo, addressBases);
+             if (token1Idx == -1) {
+                 meetEnd = true;
+                 break;
+@@ -435,13 +716,23 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>:
+         }
+         if (dealRow == 0) {
+             SetFlag<HardEvent::MTE3_MTE2>(mte3ToMte2[pingPong]);
+-            pingPong ^= 1;
+             return;
+         }
+         SetFlag<HardEvent::MTE2_MTE3>(mte2ToMte3[pingPong]);
+         WaitFlag<HardEvent::MTE2_MTE3>(mte2ToMte3[pingPong]);
+-        // 2、copy kv out, ub -> l1
+-        CopyOutKvUb2Gm(v0ResGm, stage0OutUb, dealRow, s2Start, runInfo, constInfo);
++        if constexpr (WriteKvToL1) {
++            if (s2Start == sparseS2Start) {
++                // Before the first write, carry the previous occupant's Vec2 wait from V to MTE3.
++                // The first ping bank's MTE2 work also orders reuse of this bridge across tiles.
++                SetFlag<HardEvent::MTE2_V>(mte2ToV);
++                WaitFlag<HardEvent::MTE2_V>(mte2ToV);
++                SetFlag<HardEvent::V_MTE3>(kvSlotReadyToMte3);
++                WaitFlag<HardEvent::V_MTE3>(kvSlotReadyToMte3);
++            }
++            CopyOutKvUb2L1(outputL1, stage0OutUb, dealRow, s2Start, runInfo);
++        } else {
++            CopyOutKvUb2Gm(v0ResGm, stage0OutUb, dealRow, s2Start, runInfo, constInfo);
++        }
+         SetFlag<HardEvent::MTE3_MTE2>(mte3ToMte2[pingPong]);
+         s2Start += dealRow;
+         pingPong ^= 1;
+@@ -538,7 +829,8 @@ __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>::ProcessVec1SoftmaxDispat
+ }
+ 
+ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>::ProcessVec2(
+-    Buffer<BufferType::UB, SyncType::CROSS_CORE_SYNC_BOTH>& bmm2ResBuf, RunInfo& runInfo, ConstInfo& constInfo)
++    Buffer<BufferType::UB, SyncType::CROSS_CORE_SYNC_BOTH>& bmm2ResBuf, RunInfo& runInfo, ConstInfo& constInfo,
++    __gm__ float* partialWorkspace, uint32_t partialSlot, bool retainLocal)
+ {
+     bmm2ResBuf.WaitCrossCore();
+     if (unlikely(runInfo.vec2MBaseSize == 0)) {
+@@ -577,11 +869,103 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>:
+                                                                      sfaDTemplateAlign64, 1.0);
+         }
+ 
+-        this->CopyOutAttentionOut(runInfo, constInfo, vec2ResUb, 0, sfaVec2CalcSize);
++        if (partialWorkspace != nullptr) {
++            StoreBalancedPartial(partialWorkspace, partialSlot, runInfo, vec2ResUb);
++        } else if (!retainLocal) {
++            this->CopyOutAttentionOut(runInfo, constInfo, vec2ResUb, 0, sfaVec2CalcSize);
++        }
+     }
+     SetFlag<HardEvent::MTE3_V>(mte3ToVAttnOutId);
+ }
+ 
++TEMPLATES_DEF_NO_DEFAULT
++__aicore__ inline void SFAVectorService<TEMPLATE_ARGS>::StoreBalancedPartial(
++    __gm__ float* partialWorkspace, uint32_t partialSlot, const RunInfo& runInfo, LocalTensor<T>& partial)
++{
++    GlobalTensor<float> splitS2Gm;
++    splitS2Gm.SetGlobalBuffer(partialWorkspace);
++    const uint64_t splitS2Slot = static_cast<uint64_t>(partialSlot) * SFABalancedDecode::PARTIAL_ELEMENTS;
++    LocalTensor<float> maxUb = softmaxMaxBuf[runInfo.multiCoreIdxMod2].template Get<float>();
++    LocalTensor<float> sumUb = softmaxSumBuf[runInfo.multiCoreIdxMod2].template Get<float>();
++    LocalTensor<float> partialFp32 = partial.template ReinterpretCast<float>();
++    SetFlag<HardEvent::V_MTE3>(vToMte3AttnOutId);
++    WaitFlag<HardEvent::V_MTE3>(vToMte3AttnOutId);
++    DataCopy(splitS2Gm[splitS2Slot], partialFp32, SFABalancedDecode::OUTPUT_ELEMENTS);
++    DataCopy(splitS2Gm[splitS2Slot + SFABalancedDecode::MAX_OFFSET], maxUb, SFABalancedDecode::HEADS);
++    DataCopy(splitS2Gm[splitS2Slot + SFABalancedDecode::SUM_OFFSET], sumUb, SFABalancedDecode::HEADS);
++}
++
++TEMPLATES_DEF_NO_DEFAULT
++__aicore__ inline void SFAVectorService<TEMPLATE_ARGS>::FinishBalancedPartial()
++{
++    // Drain this Vector's DMA before the barrier. Restore the event for merge/UninitLocalBuffer.
++    WaitFlag<HardEvent::MTE3_V>(mte3ToVAttnOutId);
++    SetFlag<HardEvent::MTE3_V>(mte3ToVAttnOutId);
++}
++
++TEMPLATES_DEF_NO_DEFAULT
++__aicore__ inline void SFAVectorService<TEMPLATE_ARGS>::MergeBalancedQuery(
++    __gm__ float* partialWorkspace, uint32_t query, ConstInfo& constInfo, uint32_t coreCapacity,
++    uint32_t parts, uint32_t statsBank, mm2ResPos& bmm2Scratch)
++{
++    using namespace SFABalancedDecode;
++    GlobalTensor<float> workspace;
++    workspace.SetGlobalBuffer(partialWorkspace);
++    const uint32_t owner = static_cast<uint64_t>(query) * TILES_PER_QUERY / coreCapacity;
++    WaitFlag<HardEvent::MTE3_V>(mte3ToVAttnOutId);
++    WaitFlag<HardEvent::MTE3_MTE2>(mte3ToMte2[0]);
++    // Final Vec2 has consumed the Cube result; fence those reads before reusing its UB.
++    const auto vToMte2 = GetTPipePtr()->FetchEventID(HardEvent::V_MTE2);
++    SetFlag<HardEvent::V_MTE2>(vToMte2);
++    WaitFlag<HardEvent::V_MTE2>(vToMte2);
++
++    LocalTensor<float> stats = stage0OutBuf[0].template Get<float>();
++    DataCopy(stats, softmaxMaxBuf[statsBank].template Get<float>(), HEADS);
++    DataCopy(stats[HEADS], softmaxSumBuf[statsBank].template Get<float>(), HEADS);
++    for (uint32_t part = 1; part < parts; ++part) {
++        const uint64_t offset = static_cast<uint64_t>(RemotePartialSlot(owner + part, coreCapacity)) * PARTIAL_ELEMENTS;
++        DataCopy(stats[2 * part * HEADS], workspace[offset + MAX_OFFSET],
++                 2 * HEADS);
++    }
++    SetFlag<HardEvent::MTE2_V>(mte2ToV);
++    WaitFlag<HardEvent::MTE2_V>(mte2ToV);
++    PipeBarrier<PIPE_V>();
++    auto weights = reinterpret_cast<__ubuf__ float*>(stats.GetPhyAddr());
++    if (parts == THREE_PARTS) {
++        ComputeThreePartMergeWeights(weights);
++    } else {
++        ComputeTwoPartMergeWeights(weights);
++    }
++    PipeBarrier<PIPE_V>();
++
++    LocalTensor<float> output = stage2OutBuf.template Get<float>();
++    LocalTensor<float> remote = bmm2Scratch.template GetTensor<float>();
++    for (uint32_t part = 1; part < parts; ++part) {
++        if (part > 1) {
++            SetFlag<HardEvent::V_MTE2>(vToMte2);
++            WaitFlag<HardEvent::V_MTE2>(vToMte2);
++        }
++        const uint64_t offset = static_cast<uint64_t>(RemotePartialSlot(owner + part, coreCapacity)) * PARTIAL_ELEMENTS;
++        DataCopy(remote, workspace[offset], OUTPUT_ELEMENTS);
++        SetFlag<HardEvent::MTE2_V>(mte2ToV);
++        WaitFlag<HardEvent::MTE2_V>(mte2ToV);
++        auto localData = reinterpret_cast<__ubuf__ float*>(output.GetPhyAddr());
++        auto peerData = reinterpret_cast<__ubuf__ float*>(remote.GetPhyAddr());
++        if (part == 1) {
++            MergeTwoPartRows(localData, peerData, weights, weights + HEADS, HEADS);
++        } else {
++            AccumulateBalancedRows(localData, peerData, weights + part * HEADS);
++        }
++        PipeBarrier<PIPE_V>();
++    }
++    RunInfo outputInfo{};
++    outputInfo.attentionOutOffset = static_cast<int64_t>(query) * OUTPUT_ELEMENTS;
++    outputInfo.vec2MRealSize = HEADS;
++    CopyOutAttentionOut(outputInfo, constInfo, output, 0, OUTPUT_ELEMENTS);
++    SetFlag<HardEvent::MTE3_MTE2>(mte3ToMte2[0]);
++    SetFlag<HardEvent::MTE3_V>(mte3ToVAttnOutId);
++}
++
+ TEMPLATES_DEF_NO_DEFAULT
+ template <typename VEC2_RES_T>
+ __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>::Bmm2DataCopyOut(RunInfo& runInfo, ConstInfo& constInfo,
+@@ -787,6 +1171,9 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>:
+     vToMte3LseOutId = GetTPipePtr()->AllocEventID<HardEvent::V_MTE3>();
+ 
+     mte2ToV = GetTPipePtr()->AllocEventID<HardEvent::MTE2_V>();
++    if constexpr (CAN_USE_DIRECT_KV_L1) {
++        kvSlotReadyToMte3 = GetTPipePtr()->AllocEventID<HardEvent::V_MTE3>();
++    }
+     mte3ToMte2[0] = GetTPipePtr()->AllocEventID<HardEvent::MTE3_MTE2>();
+     mte3ToMte2[1] = GetTPipePtr()->AllocEventID<HardEvent::MTE3_MTE2>();
+     SetFlag<HardEvent::MTE3_MTE2>(mte3ToMte2[0]);
+@@ -814,6 +1201,9 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>:
+         GetTPipePtr()->ReleaseEventID<HardEvent::MTE2_MTE3>(mte2ToMte3[0]);
+         GetTPipePtr()->ReleaseEventID<HardEvent::MTE2_MTE3>(mte2ToMte3[1]);
+         GetTPipePtr()->ReleaseEventID<HardEvent::MTE2_V>(mte2ToV);
++        if constexpr (CAN_USE_DIRECT_KV_L1) {
++            GetTPipePtr()->ReleaseEventID<HardEvent::V_MTE3>(kvSlotReadyToMte3);
++        }
+     }
+ }
+ 
+@@ -929,7 +1319,13 @@ public:
+     {}
+ 
+     using mm2ResPos = Buffer<BufferType::UB, SyncType::CROSS_CORE_SYNC_BOTH>;
+-    __aicore__ inline void ProcessVec2(mm2ResPos& bmm2ResBuf, RunInfo& runInfo, ConstInfo& constInfo) {}
++    __aicore__ inline void ProcessVec2(mm2ResPos& bmm2ResBuf, RunInfo& runInfo, ConstInfo& constInfo,
++                                       __gm__ float* partialWorkspace = nullptr, uint32_t partialSlot = 0,
++                                       bool retainLocal = false) {}
++    __aicore__ inline void FinishBalancedPartial() {}
++    __aicore__ inline void MergeBalancedQuery(__gm__ float* partialWorkspace, uint32_t query, ConstInfo& constInfo,
++                                             uint32_t coreCapacity, uint32_t parts, uint32_t statsBank,
++                                             mm2ResPos& bmm2Scratch) {}
+ };
+ } // namespace BaseApi
+ 
+diff --git a/attention/sparse_flash_attention/op_kernel/sparse_flash_attention_q48_balance.h b/attention/sparse_flash_attention/op_kernel/sparse_flash_attention_q48_balance.h
+new file mode 100644
+index 00000000..d3900cbb
+--- /dev/null
++++ b/attention/sparse_flash_attention/op_kernel/sparse_flash_attention_q48_balance.h
+@@ -0,0 +1,82 @@
++#ifndef SPARSE_FLASH_ATTENTION_Q48_BALANCE_H
++#define SPARSE_FLASH_ATTENTION_Q48_BALANCE_H
++
++#include <cstdint>
++
++#if defined(__CCE_AICORE__)
++#define SFA_BALANCE_INLINE __aicore__ inline
++#else
++#define SFA_BALANCE_INLINE inline
++#endif
++
++namespace SFABalancedDecode {
++constexpr uint32_t CORES = 64;
++constexpr uint32_t HEADS = 64;
++constexpr uint32_t HEAD_DIM = 512;
++constexpr uint32_t TWO_PARTS = 2;
++constexpr uint32_t THREE_PARTS = 3;
++constexpr uint32_t TILE_ROWS = 128;
++constexpr uint32_t TILES_PER_QUERY = 16;
++constexpr uint32_t MIN_TILES_SAVED_PER_CORE = 4;
++constexpr uint32_t INDEX_COUNT = TILES_PER_QUERY * TILE_ROWS;
++constexpr uint32_t OUTPUT_ELEMENTS = HEADS * HEAD_DIM;
++constexpr uint32_t MAX_OFFSET = OUTPUT_ELEMENTS;
++constexpr uint32_t SUM_OFFSET = MAX_OFFSET + HEADS;
++constexpr uint32_t PARTIAL_ELEMENTS = SUM_OFFSET + HEADS;
++
++SFA_BALANCE_INLINE constexpr uint32_t TilesPerCore(uint32_t queries)
++{
++    const uint32_t balancedTiles = (static_cast<uint64_t>(queries) * TILES_PER_QUERY + CORES - 1) / CORES;
++    // Small workloads use two cores per query instead of creating four-way merges.
++    return balancedTiles < TILES_PER_QUERY / 2 ? TILES_PER_QUERY / 2 : balancedTiles;
++}
++
++SFA_BALANCE_INLINE constexpr bool HasUsefulTileBudget(uint32_t queries)
++{
++    if (queries == 0) {
++        return false;
++    }
++    const uint32_t coreTiles = TilesPerCore(queries);
++    const uint32_t originalTiles = ((static_cast<uint64_t>(queries) + CORES - 1) / CORES) * TILES_PER_QUERY;
++    // Compare critical-path work, including query counts larger than the core count.
++    return coreTiles + MIN_TILES_SAVED_PER_CORE <= originalTiles;
++}
++
++SFA_BALANCE_INLINE constexpr uint32_t PartsPerQuery(uint32_t coreTiles)
++{
++    // The largest query start offset is coreTiles minus gcd(coreTiles, TILES_PER_QUERY).
++    uint32_t a = coreTiles;
++    uint32_t b = TILES_PER_QUERY;
++    while (b != 0) {
++        const uint32_t remainder = a % b;
++        a = b;
++        b = remainder;
++    }
++    return 1 + (coreTiles - a + TILES_PER_QUERY - 1) / coreTiles;
++}
++
++SFA_BALANCE_INLINE constexpr uint64_t WorkspaceBytes(uint32_t queries)
++{
++    // Each core can produce at most one remote fragment. Reserve for any
++    // actual Q up to the tensor capacity, including graph padding.
++    const uint32_t slots = queries <= CORES / 2 ? queries : CORES - CORES / TILES_PER_QUERY;
++    return static_cast<uint64_t>(slots) * PARTIAL_ELEMENTS * sizeof(float);
++}
++
++SFA_BALANCE_INLINE constexpr uint32_t RemotePartialSlot(uint32_t core, uint32_t coreTiles)
++{
++    uint32_t a = coreTiles;
++    uint32_t b = TILES_PER_QUERY;
++    while (b != 0) {
++        const uint32_t remainder = a % b;
++        a = b;
++        b = remainder;
++    }
++    const uint32_t alignmentPeriod = TILES_PER_QUERY / a;
++    return core == 0 ? 0 : core - 1 - (core - 1) / alignmentPeriod;
++}
++} // namespace SFABalancedDecode
++
++#undef SFA_BALANCE_INLINE
++
++#endif // SPARSE_FLASH_ATTENTION_Q48_BALANCE_H
